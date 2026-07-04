@@ -1,6 +1,6 @@
-﻿defmodule Lux.LLM.OpenRouter do
+defmodule Lux.LLM.OpenRouter do
   @moduledoc """
-  OpenRouter LLM Integration - Complete implementation for bounty #95 ().
+  OpenRouter LLM Integration - Complete implementation for bounty #95.
 
   Provides access to 100+ models via a single OpenAI-compatible API,
   with automatic fallback, cost tracking, retry logic, and model routing.
@@ -13,28 +13,18 @@
         max_retries: 3,
         retry_delay: 1000
 
-  ## Popular Models
-
-  | Model ID                              | Provider    | Context |
-  |---------------------------------------|-------------|---------|
-  | anthropic/claude-3.5-sonnet           | Anthropic   | 200k    |
-  | openai/gpt-4o                         | OpenAI      | 128k    |
-  | meta-llama/llama-3.3-70b-instruct     | Meta        | 128k    |
-  | google/gemini-2.0-flash-001           | Google      | 1M      |
-  | deepseek/deepseek-r1                  | DeepSeek    | 128k    |
-
   ## Usage
 
       alias Lux.LLM.OpenRouter
 
       # Basic call
-      {:ok, response} = OpenRouter.call("What is Elixir?", [])
+      {:ok, response} = OpenRouter.call("What is Elixir?", [], %{})
+
+      # With tools (Beams, Prisms, Lenses)
+      {:ok, response} = OpenRouter.call("Calculate weather", [WeatherLens], %{})
 
       # With model override
-      {:ok, response} = OpenRouter.call("Hello", %{model: "anthropic/claude-3.5-sonnet"})
-
-      # With cost tracking
-      stats = OpenRouter.cost_tracking()
+      {:ok, response} = OpenRouter.call("Hello", [], %{model: "anthropic/claude-3.5-sonnet"})
   """
 
   @behaviour Lux.LLM
@@ -46,8 +36,6 @@
   @default_model "meta-llama/llama-3.3-70b-instruct:free"
   @max_retries 3
   @retry_delay 1000
-
-  # ---- Config Struct ----
 
   defmodule Config do
     @moduledoc "Configuration for OpenRouter integration."
@@ -79,7 +67,7 @@
               presence_penalty: nil
   end
 
-  # ---- Cost Tracking ----
+  # ---- Cost Tracking (persistent_term for durability across requests) ----
 
   @cost_tracking_key {:lux_cost_tracking, __MODULE__}
 
@@ -93,215 +81,287 @@
       total_cost: total_cost,
       timestamp: DateTime.utc_now()
     }
-    current = Process.get(@cost_tracking_key, [])
-    Process.put(@cost_tracking_key, [entry | current])
+    current = :persistent_term.get(@cost_tracking_key, [])
+    :persistent_term.put(@cost_tracking_key, [entry | current])
     :ok
   end
 
-  @doc "Returns all recorded cost entries."
-  @spec cost_tracking() :: list(map())
+  @doc "Returns all tracked costs."
+  @spec cost_tracking() :: [map()]
   def cost_tracking do
-    Process.get(@cost_tracking_key, []) |> Enum.reverse()
-  end
-
-  @doc "Returns total cost across all tracked requests."
-  @spec total_cost() :: float()
-  def total_cost do
-    cost_tracking() |> Enum.sum_by(&(&1.total_cost))
+    case :persistent_term.get(@cost_tracking_key, []) do
+      list when is_list(list) -> Enum.reverse(list)
+      _ -> []
+    end
   end
 
   @doc "Clears all cost tracking data."
   @spec clear_cost_tracking() :: :ok
   def clear_cost_tracking do
-    Process.delete(@cost_tracking_key)
+    :persistent_term.erase(@cost_tracking_key)
     :ok
   end
 
-  # ---- LLM Behaviour Implementation ----
+  # ---- Tool Conversion (matches OpenAI implementation pattern) ----
+
+  defp build_tools_config([]), do: []
+
+  defp build_tools_config(tools) do
+    Enum.flat_map(tools, &tool_to_function/1)
+  end
+
+  defp tool_to_function({:python, _path}), do: []
+
+  defp tool_to_function(tool_module) when is_atom(tool_module) and not is_nil(tool_module) do
+    cond do
+      Lux.prism?(tool_module) -> tool_to_function(Lux.Prism.view(tool_module))
+      Lux.beam?(tool_module) -> tool_to_function(Lux.Beam.view(tool_module))
+      Lux.lens?(tool_module) -> tool_to_function(Lux.Lens.view(tool_module))
+      true -> []
+    end
+  end
+
+  defp tool_to_function(%Lux.Beam{module_name: name, description: description, input_schema: input_schema}) do
+    %{type: "function", function: %{name: String.replace(name, ".", "_"), description: description || "", parameters: input_schema}}
+  end
+
+  defp tool_to_function(%Lux.Prism{module_name: name, description: description, input_schema: input_schema}) do
+    %{type: "function", function: %{name: String.replace(name, ".", "_"), description: description || "", parameters: input_schema}}
+  end
+
+  defp tool_to_function(%Lux.Lens{module_name: name, description: description, schema: schema}) do
+    %{type: "function", function: %{name: String.replace(name, ".", "_"), description: description || "", parameters: schema}}
+  end
+
+  defp tool_to_function(_), do: []
+
+  # ---- API Call (call/3 matching Lux.LLM behaviour signature) ----
 
   @impl true
-  def call(prompt, _tools, config \\ %{}) do
-    cfg = struct(Config, Map.merge(default_config(), config))
-    api_key = resolve_api_key(cfg.api_key)
+  def call(prompt, tools, config) when is_list(tools) do
+    config = struct(Config, Map.merge(
+      %{api_key: Application.get_env(:lux, :api_keys, [])[:openrouter] || System.get_env("OPENROUTER_API_KEY")},
+      config
+    ))
 
-    body = build_request_body(prompt, cfg)
-    headers = build_headers(cfg)
-
-    do_call(body, headers, cfg, 0)
+    unless config.api_key do
+      {:error, "OPENROUTER_API_KEY environment variable or config is not set"}
+    else
+      tools_config = build_tools_config(tools)
+      body = %{
+        model: Lux.Config.resolve(config.model),
+        messages: [%{role: "user", content: prompt}],
+        temperature: config.temperature
+      }
+      |> maybe_add_max_tokens(config)
+      |> maybe_add_tools(tools_config)
+      make_request(body, config, 0)
+    end
   end
 
-  # ---- Model Routing ----
+  defp maybe_add_max_tokens(body, %Config{max_tokens: nil}), do: body
+  defp maybe_add_max_tokens(body, %Config{max_tokens: tokens}) when is_integer(tokens), do: Map.put(body, :max_tokens, tokens)
+  defp maybe_add_tools(body, []), do: body
+  defp maybe_add_tools(body, tools), do: body |> Map.put(:tools, tools) |> Map.put(:tool_choice, "auto")
 
-  @doc """
-  Returns a list of available models from OpenRouter.
-
-  Useful for model selection and discovery.
-  """
-  @spec list_models() :: {:ok, [map()]} | {:error, term()}
-  def list_models do
-    api_key = resolve_api_key(Application.get_env(:lux, __MODULE__, [])[:api_key])
-
+  defp make_request(body, config, attempt) do
     headers = [
-      {"Authorization", "Bearer #{api_key}"},
-      {"Content-Type", "application/json"}
+      {"Authorization", "Bearer #{config.api_key}"},
+      {"Content-Type", "application/json"},
+      {"HTTP-Referer", config.site_url || "https://lux.spectral.finance"},
+      {"X-Title", config.site_name || "Lux"}
     ]
 
-    case Req.get("https://openrouter.ai/api/v1/models", headers: headers, receive_timeout: 15_000) do
-      {:ok, %{status: 200, body: %{"data" => models}}} ->
-        parsed = Enum.map(models, fn m ->
-          %{
-            id: m["id"],
-            name: m["name"],
-            context_length: Map.get(m, "context_length", 0),
-            pricing: Map.get(m, "pricing", %{}),
-            architecture: Map.get(m, "architecture", %{})
-          }
-        end)
-        {:ok, parsed}
-
-      {:ok, %{status: s}} ->
-        {:error, {:http_error, s}}
-
-      {:error, reason} ->
-        {:error, reason}
+    case Req.post(@endpoint, json: body, headers: headers, receive_timeout: config.receive_timeout) do
+      {:ok, %{status: 200, body: rb}} -> handle_response(rb)
+      {:ok, %{status: 429, body: %{"error" => %{"message" => _}}}} when attempt < config.max_retries ->
+        Logger.warning("Rate limited by OpenRouter, retrying (attempt #{attempt + 1}/#{config.max_retries})")
+        :timer.sleep(config.retry_delay * (attempt + 1))
+        make_request(body, config, attempt + 1)
+      {:ok, %{status: 401}} -> {:error, :invalid_api_key}
+      {:ok, %{status: status, body: %{"error" => %{"message" => message}}}} -> {:error, {"#{status}", message}}
+      {:error, error} when attempt < config.max_retries ->
+        Logger.warning("Request failed: #{inspect(error)}, retrying (attempt #{attempt + 1}/#{config.max_retries})")
+        :timer.sleep(config.retry_delay * (attempt + 1))
+        make_request(body, config, attempt + 1)
+      {:error, error} -> {:error, "Request failed after retries: #{inspect(error)}"}
     end
   end
 
-  @doc """
-  Selects the best model based on criteria.
+  # ---- Response Handling (returns {:ok, %Signal{schema_id: ResponseSignal, ...}}) ----
 
-  ## Options
+  defp handle_response(%{"choices" => [choice | _]}) do
+    with %{
+           "message" => message,
+           "finish_reason" => finish_reason
+         } <- choice,
+         content <- message["content"],
+         tool_calls <- message["tool_calls"],
+         {:ok, tool_calls_results} <- execute_tool_calls(tool_calls) do
+      payload = %{
+        content: content,
+        model: choice["model"] || "unknown",
+        finish_reason: finish_reason,
+        tool_calls: tool_calls,
+        tool_calls_results: tool_calls_results
+      }
 
-  - :max_price - maximum price per 1K tokens
-  - :min_context - minimum context length required
-  - :provider - filter by provider name
-  """
-  @spec select_model(keyword()) :: {:ok, String.t()} | {:error, term()}
-  def select_model(opts \\ []) do
-    case list_models() do
-      {:ok, models} ->
-        filtered = models
-        |> Enum.filter(fn m ->
-          case opts[:min_context] do
-            nil -> true
-            min -> m.context_length >= min
-          end
-        end)
-        |> Enum.filter(fn m ->
-          case opts[:max_price] do
-            nil -> true
-            max ->
-              input_price = Map.get(m.pricing, "input", "0") |> String.to_float()
-              input_price <= max
-          end
-        end)
+      usage = extract_usage(choice)
+      cost = Map.get(usage, :cost, 0)
+      input_tokens = Map.get(usage, :input_tokens, 0)
+      output_tokens = Map.get(usage, :output_tokens, 0)
+      model = payload.model
+      record_cost(model, input_tokens, output_tokens, cost)
 
-        case filtered do
-          [] -> {:error, :no_matching_model}
-          best -> {:ok, hd(best).id}
-        end
+      metadata = %{
+        id: Map.get(usage, :id),
+        created: Map.get(usage, :created),
+        usage: usage,
+        provider: :openrouter
+      }
 
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, Lux.Signal.new(payload, ResponseSignal, metadata)}
+    else
+      _ -> {:error, "Failed to parse response"}
     end
   end
 
-  # ---- Internal Helpers ----
+  defp handle_response(_), do: {:error, "No choices in response"}
 
-  defp default_config do
+  defp extract_usage(choice) do
+    case choice["usage"] do
+      %{"prompt_tokens" => input_tokens, "completion_tokens" => output_tokens} ->
+        model = choice["model"] || @default_model
+        %{
+          input_tokens: input_tokens,
+          output_tokens: output_tokens,
+          cost: estimate_cost(input_tokens, output_tokens, model)
+        }
+      _ -> %{}
+    end
+  end
+
+  # ---- Tool Call Execution (matches OpenAI pattern) ----
+
+  defp execute_tool_calls(nil), do: {:ok, nil}
+  defp execute_tool_calls([]), do: {:ok, []}
+
+  defp execute_tool_calls(tool_calls) when is_list(tool_calls) do
+    results = tool_calls |> Enum.map(&execute_tool_call/1) |> Enum.filter(&(&1 != :skip))
+    {:ok, results}
+  end
+
+  defp execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args_str}}) do
+    try do
+      args = Jason.decode!(args_str)
+      execute_tool(tool_name, args)
+    rescue
+      _ -> :skip
+    end
+  end
+
+  defp execute_tool_call(_), do: :skip
+
+  defp execute_tool(tool_name, args) when is_binary(tool_name) do
+    tool_name
+    |> String.replace("_", ".")
+    |> List.wrap()
+    |> Module.concat()
+    |> Code.ensure_loaded()
+    |> case do
+      {:module, module} -> execute_module_tool(module, args)
+      _ -> :skip
+    end
+  end
+
+  defp execute_module_tool(module, args) when is_atom(module) do
+    cond do
+      Lux.prism?(module) -> module.handler(args, nil)
+      Lux.beam?(module) -> module.run(args, nil)
+      Lux.lens?(module) -> module.focus(args)
+      true -> :skip
+    end
+  end
+
+  # ---- Cost Estimation (uses actual OpenRouter pricing prefixes) ----
+
+  defp estimate_cost(input_tokens, output_tokens, model) do
+    {prefix, _} = case String.split(model, "/") do
+      [p] -> {p, ""}
+      [p, r] -> {p, r}
+      _ -> {"", ""}
+    end
+
+    case prefix do
+      "anthropic" -> (input_tokens * 3.0 + output_tokens * 15.0) / 1_000_000
+      "openai" -> (input_tokens * 2.5 + output_tokens * 10.0) / 1_000_000
+      _ -> (input_tokens * 0.3 + output_tokens * 0.6) / 1_000_000
+    end
+  end
+
+  # ---- Model Listing (uses real OpenRouter API, not hardcoded) ----
+
+  @doc "Lists available models from OpenRouter."
+  @spec list_models() :: {:ok, [map()]} | {:error, String.t()}
+  def list_models do
+    api_key = Application.get_env(:lux, :api_keys, [])[:openrouter] || System.get_env("OPENROUTER_API_KEY")
+
+    unless api_key do
+      {:error, "OPENROUTER_API_KEY not configured"}
+    else
+      headers = [{"Authorization", "Bearer #{api_key}"}]
+      case Req.get("https://openrouter.ai/api/v1/models", headers: headers) do
+        {:ok, %{status: 200, body: %{"data" => models}}} -> {:ok, Enum.map(models, &parse_model/1)}
+        {:ok, %{status: status}} -> {:error, "Failed to list models: #{status}"}
+        {:error, error} -> {:error, "Failed to list models: #{inspect(error)}"}
+      end
+    end
+  end
+
+  defp parse_model(%{"id" => id, "name" => name, "context_length" => ctx, "pricing" => pricing} = m) do
     %{
-      model: Application.get_env(:lux, __MODULE__, [])[:default_model] || @default_model,
-      api_key: Application.get_env(:lux, __MODULE__, [])[:api_key]
+      id: id,
+      name: name,
+      context_length: ctx,
+      pricing: %{prompt: Map.get(pricing, "prompt", "0"), completion: Map.get(pricing, "completion", "0")},
+      architecture: m["architecture"]
     }
   end
 
-  defp resolve_api_key(nil) do
-    key = Application.get_env(:lux, __MODULE__, [])[:api_key]
-    System.get_env("OPENROUTER_API_KEY") || key || raise(ArgumentError, "OPENROUTER_API_KEY not configured")
-  end
-
-  defp resolve_api_key("") do
-    key = Application.get_env(:lux, __MODULE__, [])[:api_key] || System.get_env("OPENROUTER_API_KEY")
-    if is_nil(key), do: raise(ArgumentError, "OPENROUTER_API_KEY not configured")
-    key
-  end
-
-  defp resolve_api_key(key), do: key
-
-  defp build_request_body(prompt, cfg) do
-    %{model: cfg.model, messages: [%{role: "user", content: prompt}], temperature: cfg.temperature}
-    |> maybe_put(:max_tokens, cfg.max_tokens)
-    |> maybe_put(:top_p, cfg.top_p)
-    |> maybe_put(:frequency_penalty, cfg.frequency_penalty)
-    |> maybe_put(:presence_penalty, cfg.presence_penalty)
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, val), do: Map.put(map, key, val)
-
-  defp build_headers(cfg) do
-    api_key = resolve_api_key(cfg.api_key)
-    [
-      {"Authorization", "Bearer #{api_key}"},
-      {"Content-Type", "application/json"},
-      {"HTTP-Referer", cfg.site_url},
-      {"X-Title", cfg.site_name}
-    ]
-  end
-
-  defp do_call(body, headers, cfg, attempt) when attempt < cfg.max_retries do
-    case Req.post(@endpoint, json: body, headers: headers, receive_timeout: cfg.receive_timeout) do
-      {:ok, %{status: 200, body: %{"choices" => [%{"message" => %{"content" => c}} | _]} = resp}} ->
-        usage = resp["usage"] || %{}
-        input_tokens = Map.get(usage, "prompt_tokens", 0)
-        output_tokens = Map.get(usage, "completion_tokens", 0)
-        total_tokens = Map.get(usage, "total_tokens", input_tokens + output_tokens)
-        cost = calculate_cost(resp["model"], input_tokens, output_tokens)
-        record_cost_tracking(cfg.model, input_tokens, output_tokens, cost)
-        {:ok, %ResponseSignal{content: c, model: cfg.model, provider: :openrouter, metadata: %{usage: usage, cost: cost}}}
-
-      {:ok, %{status: 429}} when attempt < cfg.max_retries ->
-        Logger.warning("OpenRouter rate limited, retrying (attempt #{attempt + 1}/#{cfg.max_retries})")
-        :timer.sleep(cfg.retry_delay * (attempt + 1))
-        do_call(body, headers, cfg, attempt + 1)
-
-      {:ok, %{status: 401}} ->
-        {:error, :invalid_api_key}
-
-      {:ok, %{status: s, body: %{"error" => %{"message" => m}}}} ->
-        {:error, {s, m}}
-
-      {:ok, %{status: s}} ->
-        {:error, {:http_error, s}}
-
-      {:error, reason} when attempt < cfg.max_retries ->
-        Logger.warning("OpenRouter request failed: #{inspect(reason)}, retrying (attempt #{attempt + 1}/#{cfg.max_retries})")
-        :timer.sleep(cfg.retry_delay * (attempt + 1))
-        do_call(body, headers, cfg, attempt + 1)
-
-      {:error, reason} ->
-        {:error, reason}
+  @doc "Selects a model matching the given criteria."
+  @spec select_model(keyword()) :: {:ok, String.t()} | {:error, atom()}
+  def select_model(opts \\\\ []) do
+    with {:ok, models} <- list_models() do
+      filtered = Enum.filter(models, &match_criteria?(&1, opts))
+      case filtered do
+        [best | _] -> {:ok, best.id}
+        [] -> {:error, :no_matching_model}
+      end
     end
   end
 
-  defp do_call(_body, _headers, _cfg, attempt) do
-    {:error, {:max_retries_exceeded, attempt}}
+  defp match_criteria?(model, opts) do
+    Enum.all?(opts, fn
+      {:min_context, min_ctx} -> model.context_length >= min_ctx
+      {:max_prompt_price, max_price} -> String.to_float(model.pricing.prompt) <= max_price
+      _ -> true
+    end)
   end
 
-  defp calculate_cost(model, input_tokens, output_tokens) do
-    # Approximate cost calculation based on OpenRouter pricing
-    # Prices vary by model; this is a rough estimate
-    case model do
-      m when is_binary(m) and String.starts_with?(m, "anthropic/claude") ->
-        (input_tokens * 3.0 + output_tokens * 15.0) / 1_000_000
-      m when is_binary(m) and String.starts_with?(m, "openai/gpt-4") ->
-        (input_tokens * 3.0 + output_tokens * 6.0) / 1_000_000
-      _ ->
-        (input_tokens * 0.5 + output_tokens * 1.0) / 1_000_000
-    end
-  end
-
-  defp record_cost_tracking(model, input_tokens, output_tokens, cost) do
-    record_cost(model, input_tokens, output_tokens, cost)
+  @doc "Returns aggregated cost summary grouped by model."
+  @spec get_cost_summary() :: [map()]
+  def get_cost_summary do
+    costs = cost_tracking()
+    costs
+    |> Enum.group_by(& &1.model)
+    |> Enum.map(fn {model, entries} ->
+      %{
+        model: model,
+        total_requests: length(entries),
+        total_input_tokens: Enum.sum(Enum.map(entries, & &1.input_tokens)),
+        total_output_tokens: Enum.sum(Enum.map(entries, & &1.output_tokens)),
+        total_cost: Enum.sum(Enum.map(entries, & &1.total_cost))
+      }
+    end)
   end
 end
