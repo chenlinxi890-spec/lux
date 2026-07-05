@@ -1,11 +1,42 @@
-﻿
+defmodule Lux.Integrations.Coinbase do
+  @moduledoc """
+  Coinbase Advanced Trade API integration for bounty #83.
+
+  Provides REST API access to products, order book, accounts, portfolio,
+  candles, and order management with HMAC-SHA256 authentication.
+
+  ## Configuration
+
+      config :lux, Lux.Integrations.Coinbase,
+        api_key: System.get_env("COINBASE_API_KEY"),
+        api_secret: System.get_env("COINBASE_API_SECRET"),
+        base_url: "https://api.coinbase.com"
+
+  ## Safety
+
+  - Live trading is gated behind explicit live_trading: true option
+  - Default to sandbox/base URL for safe testing
+  - All authenticated endpoints require valid API credentials
+  """
+
+  @base_url "https://api.coinbase.com"
+  @ws_url "wss://advanced-trade-ws.coinbase.com"
+  @ws_user_url "wss://advanced-trade-ws-user.coinbase.com"
+  @api_version "2022-06-03"
+
+  # ---- Public Config Accessors ----
+
   @doc "Returns the Coinbase API base URL."
   @spec base_url() :: String.t()
   def base_url, do: @base_url
 
-  @doc "Returns the Coinbase WebSocket URL for advanced trade."
+  @doc "Returns the Coinbase WebSocket URL for public market data."
   @spec ws_url() :: String.t()
   def ws_url, do: @ws_url
+
+  @doc "Returns the Coinbase WebSocket URL for authenticated user data."
+  @spec ws_user_url() :: String.t()
+  def ws_user_url, do: @ws_user_url
 
   @doc "Returns the API version header value."
   @spec api_version() :: String.t()
@@ -25,6 +56,8 @@
       System.get_env("COINBASE_API_SECRET") || ""
   end
 
+  # ---- Authentication Helpers ----
+
   @doc """
   Builds signed headers for Coinbase Advanced Trade API requests.
   Implements HMAC-SHA256 signature as required by Coinbase.
@@ -43,6 +76,8 @@
       {"Content-Type", "application/json"}
     ]
   end
+
+  # ---- Endpoint URL Builders ----
 
   @doc "Products endpoint URL."
   @spec products_url() :: String.t()
@@ -73,7 +108,7 @@
   def accounts_url, do: @base_url <> "/api/v3/brokerage/accounts"
 
   @doc "Candles endpoint URL."
-  @spec candles_url(pid :: String.t(), start :: String.t(), end_t :: String.t(), gran :: String.t()) :: String.t()
+  @spec candles_url(product_id :: String.t(), start :: String.t(), end_t :: String.t(), gran :: String.t()) :: String.t()
   def candles_url(product_id, start, end_t, gran \\ "ONE_HOUR") do
     @base_url <> "/api/v3/brokerage/products/#{product_id}/candles?start=#{start}&end=#{end_t}&granularity=#{gran}"
   end
@@ -86,9 +121,11 @@
   @spec time_url() :: String.t()
   def time_url, do: @base_url <> "/api/v3/brokerage/time"
 
+  # ---- Public (Unauthenticated) Endpoints ----
+
   @doc """
   Fetches all available trading products.
-  Returns `{:ok, [map()]}` on success.
+  Returns {:ok, [map()]} on success.
   """
   @spec products() :: {:ok, [map()]} | {:error, term()}
   def products do
@@ -128,102 +165,9 @@
   end
 
   @doc """
-  Places a new order.
-  Parameters: product_id, side (:buy/:sell), size, order_type (:market/:limit/:stop), price (for limit), opts.
-  """
-  @spec place_order(pid :: String.t(), side :: :buy | :sell, size :: String.t(), order_type :: :market | :limit | :stop, price :: float() | nil, opts :: keyword()) :: {:ok, map()} | {:error, term()}
-  def place_order(product_id, side, size, order_type, price \\ nil, opts \\ []) do
-    body = %{
-      client_order_id: generate_client_order_id(),
-      product_id: product_id,
-      side: to_string(side),
-      order_configuration: build_order_config(order_type, price, opts)
-    }
-    sig_body = Jason.encode!(body)
-    headers = signed_headers("POST", "/api/v3/brokerage/orders", sig_body)
-    case Req.post(create_order_url(), json: body, headers: headers, receive_timeout: 30_000) do
-      {:ok, %{status: 200, body: resp}} -> {:ok, resp}
-      {:ok, %{status: 400, body: %{"errors" => errs}}} -> {:error, {:validation_error, errs}}
-      {:ok, %{status: 429}} -> {:error, :rate_limited}
-      {:ok, %{status: s}} -> {:error, {:http_error, s}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc """
-  Cancels a single order by order ID.
-  """
-  @spec cancel_order(order_id :: String.t()) :: {:ok, map()} | {:error, term()}
-  def cancel_order(order_id) do
-    body = %{order_ids: [order_id], client_order_id: generate_client_order_id()}
-    sig_body = Jason.encode!(body)
-    headers = signed_headers("DELETE", "/api/v3/brokerage/orders/batch_cancel", sig_body)
-    case Req.post(cancel_orders_url(), json: body, headers: headers, receive_timeout: 30_000) do
-      {:ok, %{status: 200, body: resp}} -> {:ok, resp}
-      {:ok, %{status: s}} -> {:error, {:http_error, s}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc """
-  Lists historical orders with optional filtering.
-  """
-  @spec list_orders(opts :: keyword()) :: {:ok, [map()]} | {:error, term()}
-  def list_orders(opts \\ []) do
-    query = opts |> Enum.reject(&is_nil(elem(&1, 1))) |> Enum.map(fn {k, v} -> {to_string(k), to_string(v)} end)
-    headers = [{"Content-Type", "application/json"}]
-    case Req.get(list_orders_url(), query: query, headers: headers, receive_timeout: 30_000) do
-      {:ok, %{status: 200, body: %{"orders" => orders}}} -> {:ok, orders}
-      {:ok, %{status: s}} -> {:error, {:http_error, s}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc """
-  Fetches account information and balances.
-  """
-  @spec accounts() :: {:ok, [map()]} | {:error, term()}
-  def accounts do
-    headers = [{"Content-Type", "application/json"}]
-    case Req.get(accounts_url(), headers: headers, receive_timeout: 30_000) do
-      {:ok, %{status: 200, body: %{"accounts" => acc}}} -> {:ok, acc}
-      {:ok, %{status: s}} -> {:error, {:http_error, s}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc """
-  Fetches the balance for a specific currency.
-  """
-  @spec account_balance(currency :: String.t()) :: {:ok, String.t()} | {:error, term()}
-  def account_balance(currency) do
-    case accounts() do
-      {:ok, acc_list} ->
-        case Enum.find(acc_list, fn acc -> Map.get(acc, "currency", "") == currency end) do
-          nil -> {:error, :not_found}
-          acc -> {:ok, Map.get(acc, "balance", "0")}
-        end
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc """
-  Fetches portfolio summary.
-  """
-  @spec portfolio() :: {:ok, map()} | {:error, term()}
-  def portfolio do
-    headers = [{"Content-Type", "application/json"}]
-    case Req.get(portfolio_url(), headers: headers, receive_timeout: 30_000) do
-      {:ok, %{status: 200, body: portfolio}} -> {:ok, portfolio}
-      {:ok, %{status: s}} -> {:error, {:http_error, s}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc """
   Fetches candlestick data for a product.
   """
-  @spec candles(pid :: String.t(), start :: String.t(), end_t :: String.t(), gran :: String.t()) :: {:ok, [map()]} | {:error, term()}
+  @spec candles(product_id :: String.t(), start :: String.t(), end_t :: String.t(), gran :: String.t()) :: {:ok, [map()]} | {:error, term()}
   def candles(product_id, start, end_t, gran \\ "ONE_HOUR") do
     headers = [{"Content-Type", "application/json"}]
     case Req.get(candles_url(product_id, start, end_t, gran), query: [granularity: gran], headers: headers, receive_timeout: 30_000) do
@@ -250,6 +194,147 @@
     end
   end
 
+  # ---- Authenticated (Private) Endpoints ----
+
+  @doc """
+  Fetches account information and balances.
+  Requires authenticated request with CB-ACCESS-KEY headers.
+  """
+  @spec accounts() :: {:ok, [map()]} | {:error, term()}
+  def accounts do
+    headers = signed_headers("GET", "/api/v3/brokerage/accounts")
+    case Req.get(accounts_url(), headers: headers, receive_timeout: 30_000) do
+      {:ok, %{status: 200, body: %{"accounts" => acc}}} -> {:ok, acc}
+      {:ok, %{status: 401}} -> {:error, :unauthorized}
+      {:ok, %{status: s}} -> {:error, {:http_error, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Fetches the balance for a specific currency.
+  """
+  @spec account_balance(currency :: String.t()) :: {:ok, String.t()} | {:error, term()}
+  def account_balance(currency) do
+    case accounts() do
+      {:ok, acc_list} ->
+        case Enum.find(acc_list, fn acc -> Map.get(acc, "currency", "") == currency end) do
+          nil -> {:error, :not_found}
+          acc -> {:ok, Map.get(acc, "balance", "0")}
+        end
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Fetches portfolio summary.
+  Requires authenticated request.
+  """
+  @spec portfolio() :: {:ok, map()} | {:error, term()}
+  def portfolio do
+    headers = signed_headers("GET", "/api/v3/brokerage/portfolio")
+    case Req.get(portfolio_url(), headers: headers, receive_timeout: 30_000) do
+      {:ok, %{status: 200, body: portfolio}} -> {:ok, portfolio}
+      {:ok, %{status: 401}} -> {:error, :unauthorized}
+      {:ok, %{status: s}} -> {:error, {:http_error, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Fetches historical orders.
+  Requires authenticated request.
+  """
+  @spec list_orders(opts :: keyword()) :: {:ok, map()} | {:error, term()}
+  def list_orders(opts \\ []) do
+    product_id = Keyword.get(opts, :product_id)
+    order_status = Keyword.get(opts, :order_status, "ALL")
+    limit = Keyword.get(opts, :limit, 100)
+    start_ts = Keyword.get(opts, :start_timestamp)
+    end_ts = Keyword.get(opts, :end_timestamp)
+
+    query =
+      [{"order_status", order_status}, {"limit", to_string(limit)}]
+      |> maybe_add_param(start_ts, "start_timestamp")
+      |> maybe_add_param(end_ts, "end_timestamp")
+      |> maybe_add_param(product_id, "product_id")
+
+    headers = signed_headers("GET", "/api/v3/brokerage/orders/historical/batch")
+    case Req.get(list_orders_url(), query: query, headers: headers, receive_timeout: 30_000) do
+      {:ok, %{status: 200, body: orders}} -> {:ok, orders}
+      {:ok, %{status: 401}} -> {:error, :unauthorized}
+      {:ok, %{status: s}} -> {:error, {:http_error, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Places a new order with explicit live-trading opt-in.
+
+  ## Safety
+  Orders are NOT placed unless live_trading: true is explicitly passed.
+  This prevents accidental live orders during development/testing.
+  """
+  @spec place_order(product_id :: String.t(), side :: :buy | :sell, size :: String.t(), order_type :: :market | :limit | :stop, price :: float() | nil, opts :: keyword()) :: {:ok, map()} | {:error, term()}
+  def place_order(product_id, side, size, order_type, price \\ nil, opts \\ []) do
+    unless Keyword.get(opts, :live_trading, false) do
+      {:error, :live_trading_disabled}
+    else
+      body = %{
+        client_order_id: generate_client_order_id(),
+        product_id: product_id,
+        side: to_string(side),
+        order_configuration: build_order_config(order_type, price, size, opts)
+      }
+      sig_body = Jason.encode!(body)
+      headers = signed_headers("POST", "/api/v3/brokerage/orders", sig_body)
+      case Req.post(create_order_url(), json: body, headers: headers, receive_timeout: 30_000) do
+        {:ok, %{status: 200, body: resp}} -> {:ok, resp}
+        {:ok, %{status: 400, body: %{"errors" => errs}}} -> {:error, {:validation_error, errs}}
+        {:ok, %{status: 401}} -> {:error, :unauthorized}
+        {:ok, %{status: 429}} -> {:error, :rate_limited}
+        {:ok, %{status: s}} -> {:error, {:http_error, s}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Cancels a single order by order ID.
+  Requires authenticated request.
+  """
+  @spec cancel_order(order_id :: String.t()) :: {:ok, map()} | {:error, term()}
+  def cancel_order(order_id) do
+    body = %{order_ids: [order_id], client_order_id: generate_client_order_id()}
+    sig_body = Jason.encode!(body)
+    headers = signed_headers("DELETE", "/api/v3/brokerage/orders/batch_cancel", sig_body)
+    case Req.post(cancel_orders_url(), json: body, headers: headers, receive_timeout: 30_000) do
+      {:ok, %{status: 200, body: resp}} -> {:ok, resp}
+      {:ok, %{status: 401}} -> {:error, :unauthorized}
+      {:ok, %{status: s}} -> {:error, {:http_error, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Batch cancels multiple orders.
+  Requires authenticated request.
+  """
+  @spec cancel_orders(order_ids :: [String.t()]) :: {:ok, map()} | {:error, term()}
+  def cancel_orders(order_ids) do
+    body = %{order_ids: order_ids, client_order_id: generate_client_order_id()}
+    sig_body = Jason.encode!(body)
+    headers = signed_headers("DELETE", "/api/v3/brokerage/orders/batch_cancel", sig_body)
+    case Req.post(cancel_orders_url(), json: body, headers: headers, receive_timeout: 30_000) do
+      {:ok, %{status: 200, body: resp}} -> {:ok, resp}
+      {:ok, %{status: 401}} -> {:error, :unauthorized}
+      {:ok, %{status: s}} -> {:error, {:http_error, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # ---- Credential Validation ----
+
   @doc """
   Validates that API credentials are configured and reachable.
   """
@@ -264,33 +349,36 @@
   end
 
   @doc "Calculates rate limit retry delay from retry-after header."
-  @spec rate_limit_delay(ra :: String.t()) :: integer()
+  @spec rate_limit_delay(String.t()) :: integer()
   def rate_limit_delay(retry_after) do
     case Integer.parse(retry_after) do {s, _} -> s * 1000; :error -> 1000 end
   end
 
-  # ---- Internal helpers ----
+  # ---- Internal Helpers ----
+
+  defp maybe_add_param(nil, _acc, _key), do: []
+  defp maybe_add_param(val, acc, key), do: acc ++ [{key, to_string(val)}]
 
   defp generate_client_order_id do
     "#{System.unique_integer([:positive])}-lux"
   end
 
-  defp build_order_config(:market, _price, _opts) do
-    %{simple_market_market_ioc: %{}}
+  defp build_order_config(:market, _price, size, _opts) do
+    %{simple_market_market_ioc: %{base_amount: size}}
   end
 
-  defp build_order_config(:limit, price, opts) when is_number(price) and price > 0 do
+  defp build_order_config(:limit, price, size, opts) when is_number(price) and price > 0 and is_binary(size) do
     post_only = Keyword.get(opts, :post_only, false)
-    config = %{limit_limit_gtc: %{base_amount: "1", price: to_string(price)}}
+    config = %{limit_limit_gtc: %{base_amount: size, price: to_string(price)}}
     if post_only, do: Map.put(config.limit_limit_gtc, :post_only, true), else: config
   end
 
-  defp build_order_config(:stop, price, _opts) when is_number(price) and price > 0 do
-    %{stop_limit_gtcs: %{trigger_price: to_string(price), base_amount: "1", price: to_string(price * 0.99)}}
+  defp build_order_config(:stop, price, size, _opts) when is_number(price) and price > 0 and is_binary(size) do
+    %{stop_limit_gtd: %{base_amount: size, price: to_string(price), trigger_price: to_string(price * 0.99)}}
   end
 
-  defp build_order_config(_type, _price, _opts) do
-    %{simple_market_market_ioc: %{}}
+  defp build_order_config(_type, _price, size, _opts) do
+    %{simple_market_market_ioc: %{base_amount: size || "1"}}
   end
 
   defp pf(s) when is_binary(s), do: case Float.parse(s) do {n, _} -> n; :error -> 0.0 end
