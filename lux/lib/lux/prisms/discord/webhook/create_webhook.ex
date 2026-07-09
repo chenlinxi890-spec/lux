@@ -89,12 +89,8 @@
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} creating webhook '#{name}' in channel #{channel_id}")
 
-      body = %{
-        "name" => name,
-        "channel_id" => channel_id
-        | if(avatar_url, do: %{"avatar" => avatar_url}, else: %{})
-        |> Map.delete(nil)
-      }
+      body = %{"name" => name, "channel_id" => channel_id}
+      body = if(avatar_url, Map.put(body, "avatar", avatar_url), body)
 
       case Client.request(:post, "/channels/#{channel_id}/webhooks", %{json: body}) do
         {:ok, %{"id" => webhook_id, "name" => webhook_name, "channel_id" => returned_channel, "url" => url} = resp} ->

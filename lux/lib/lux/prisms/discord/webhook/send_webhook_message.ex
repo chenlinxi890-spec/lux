@@ -91,7 +91,7 @@
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} sending webhook message")
 
-      case do_post(webhook_url, body) do
+      case do_post(webhook_url <> "?wait=true", body) do
         {:ok, %{"id" => message_id} = resp} ->
           Logger.info("Successfully sent webhook message #{message_id}")
           {:ok, %{
@@ -189,6 +189,10 @@
       |> Req.request()
 
     case result do
+      {:ok, %{status: 204}} ->
+        # Discord Execute Webhook with wait=false returns 204 No Content
+        Logger.info("Webhook message sent (204 No Content)")
+        {:ok, %{}}
       {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
         {:ok, resp_body}
 

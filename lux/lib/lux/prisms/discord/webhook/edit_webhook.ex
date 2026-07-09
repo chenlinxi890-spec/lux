@@ -81,7 +81,7 @@
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} editing webhook #{webhook_id}: #{inspect(changes)}")
 
-      case Client.request(:post, "/webhooks/#{webhook_id}", %{json: changes}) do
+      case Client.request(:patch, "/webhooks/#{webhook_id}", %{json: changes}) do
         {:ok, %{"id" => returned_id, "name" => name, "channel_id" => channel_id} = resp} ->
           Logger.info("Successfully edited webhook #{returned_id}")
           {:ok, %{
