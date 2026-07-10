@@ -21,6 +21,29 @@
 
       # Get test summary
       summary = RustTestRunner.summary(results)
+
+  ## Mix Integration
+
+  This module is designed to be invoked via `mix test` through the
+  ExUnit integration in `Lux.RustTestRunnerTest`. For direct CLI usage,
+  implement a `Mix.Task.rust_test` module that delegates to `run/1`.
+
+      # Example Mix.Task integration (to be added separately):
+      # defmodule Mix.Tasks.RustTest do
+      #   use Mix.Task
+      #   def run(args) do
+      #     {:ok, results} = Lux.RustTestRunner.run(args)
+      #     Lux.RustTestRunner.summary(results)
+      #     |> IO.inspect()
+      #   end
+      # end
+
+  ## Cargo Project Resolution
+
+  The `run/1` and `coverage/0` functions resolve the Rust project path
+  from the Lux repository root. If no Cargo.toml is found in the
+  expected locations, an error is returned.
+
   """
 
   require Logger
@@ -28,42 +51,97 @@
   @doc "Runs all Rust tests via cargo test."
   @spec run(list(String.t())) :: {:ok, map()} | {:error, String.t()}
   def run(tests \\ []) do
-    cmd = if Enum.empty?(tests) do
-      "cargo test --all"
-    else
-      "cargo test -- " <> Enum.join(tests, " ")
-    end
+    case resolve_cargo_project_path() do
+      {:ok, project_path} ->
+        cmd_args = ["test", "--all"] ++ tests
 
-    # FIX: Capture output (no `into:` option) so parse_cargo_output works
-    case System.cmd("sh", ["-c", cmd], stderr_to_stdout: true) do
-      {output, 0} ->
-        parsed = parse_cargo_output(output)
-        {:ok, parsed}
+        case System.cmd("cargo", cmd_args,
+               cd: project_path,
+               stderr_to_stdout: true
+             ) do
+          {output, 0} ->
+            parsed = parse_cargo_output(output)
+            {:ok, parsed}
 
-      {output, exit_code} ->
-        Logger.error("Rust tests failed with exit code #{exit_code}")
-        {:error, "Tests failed (exit #{exit_code}): #{String.trim(output) |> String.slice(0, 500)}"}
+          {output, exit_code} ->
+            Logger.error("Rust tests failed with exit code #{exit_code}")
+            {:error,
+             "Tests failed (exit #{exit_code}): #{String.trim(output) |> String.slice(0, 500)}"}
+        end
+
+      {:error, reason} ->
+        {:error, "Cannot locate Rust project: #{reason}"}
     end
   end
 
   @doc "Generates coverage report via cargo tarpaulin."
   @spec coverage() :: {:ok, map()} | {:error, String.t()}
   def coverage do
-    # FIX: Capture output properly (no `into:` option)
-    case System.cmd("sh", ["-c", "which cargo-tarpaulin"], stderr_to_stdout: true) do
-      {_, 0} ->
-        cmd = "cargo tarpaulin --out Xml --out Html --engine llvm --follow-tests --timeout 120"
-        case System.cmd("sh", ["-c", cmd], stderr_to_stdout: true) do
-          {output, 0} ->
-            coverage = parse_coverage_output(output)
-            {:ok, coverage}
+    case resolve_cargo_project_path() do
+      {:ok, project_path} ->
+        # Check if cargo-tarpaulin is available
+        case System.cmd("cargo", ["tarpaulin", "--version"],
+               cd: project_path,
+               stderr_to_stdout: true
+             ) do
+          {_output, 0} ->
+            cmd_args = [
+              "tarpaulin",
+              "--out",
+              "Xml",
+              "--out",
+              "Html",
+              "--engine",
+              "llvm",
+              "--follow-tests",
+              "--timeout",
+              "120"
+            ]
 
-          {output, exit_code} ->
-            {:error, "Coverage failed (exit #{exit_code}): #{String.trim(output) |> String.slice(0, 500)}"}
+            case System.cmd("cargo", cmd_args,
+                   cd: project_path, stderr_to_stdout: true
+                 ) do
+              {output, 0} ->
+                coverage = parse_coverage_output(output)
+                {:ok, coverage}
+
+              {output, exit_code} ->
+                {:error,
+                 "Coverage failed (exit #{exit_code}): #{String.trim(output) |> String.slice(0, 500)}"}
+            end
+
+          {_output, _exit_code} ->
+            {:error, "cargo-tarpaulin not found (run: cargo install cargo-tarpaulin)"}
         end
 
-      {_path, _} ->
-        {:error, "cargo-tarpaulin not found in PATH"}
+      {:error, reason} ->
+        {:error, "Cannot locate Rust project: #{reason}"}
+    end
+  end
+
+  @doc """
+  Resolves the path to the Rust Cargo project within the Lux repository.
+
+  Searches common locations for Cargo.toml:
+  - lux/rust/ (subcrate)
+  - priv/rust/ (priv Rust project)
+  - . (repository root)
+
+  Returns {:ok, path} if found, {:error, reason} otherwise.
+  """
+  @spec resolve_cargo_project_path() :: {:ok, String.t()} | {:error, String.t()}
+  def resolve_cargo_project_path do
+    # Try common Rust project locations within the Lux repo
+    candidates = [
+      Path.join(__DIR__, "../../rust"),
+      Path.join(__DIR__, "../../../priv/rust"),
+      Path.join(__DIR__, "../../../..")
+    ]
+
+    Enum.find_value(candidates, {:error, "No Cargo.toml found in expected locations"}) do
+      path ->
+        cargo_toml = Path.join(path, "Cargo.toml")
+        if File.exists?(cargo_toml), do: {:ok, path}, else: nil
     end
   end
 
@@ -76,7 +154,11 @@
   @spec parse_cargo_output(String.t()) :: map()
   def parse_cargo_output(output) do
     # Standard cargo test result line: "test result: ok. N passed; M failed; ..."
-    result_match = Regex.run(~r/test result: (ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed/, output)
+    result_match =
+      Regex.run(
+        ~r/test result: (ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed/,
+        output
+      )
 
     passed =
       case result_match do
@@ -148,16 +230,33 @@
   @spec create_fixture(String.t(), map()) :: :ok
   def create_fixture(name, data \\ %{}) do
     fixture_dir = Path.join([:code.priv_dir(:lux), "rust_test_fixtures"])
-    File.mkdir_p!(fixture_dir)
-    fixture_file = Path.join(fixture_dir, "#{name}.json")
-    File.write!(fixture_file, Jason.encode!(data, pretty: true))
-    :ok
+
+    case File.mkdir_p(fixture_dir) do
+      :ok ->
+        fixture_file = Path.join(fixture_dir, "#{name}.json")
+        File.write!(fixture_file, Jason.encode!(data, pretty: true))
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to create fixture directory: #{inspect(reason)}")
+        :ok
+    end
   end
 
   @doc "Loads a test fixture by name."
   @spec load_fixture(String.t()) :: {:ok, map()} | {:error, String.t()}
   def load_fixture(name) do
-    fixture_file = Path.join([:code.priv_dir(:lux), "rust_test_fixtures", "#{name}.json"])
+    fixture_dir = :code.priv_dir(:lux)
+
+    fixture_file =
+      case fixture_dir do
+        {:error, _} ->
+          Path.join(["rust_test_fixtures", "#{name}.json"])
+
+        path ->
+          Path.join([path, "rust_test_fixtures", "#{name}.json"])
+      end
+
     case File.read(fixture_file) do
       {:ok, content} -> {:ok, Jason.decode!(content)}
       {:error, _} -> {:error, "Fixture not found: #{name}"}
@@ -170,19 +269,32 @@
     [:assert_exit_code_zero, :assert_test_output_contains, :assert_no_failures]
   end
 
-  defp assert_exit_code_zero(result) do
-    case result do
-      {:ok, %{tests_failed: 0}} -> true
-      _ -> false
-    end
+  @doc """
+  Asserts that the test result indicates zero failures.
+
+  Returns true only when all tests passed.
+  """
+  @spec assert_exit_code_zero({:ok, map()} | {:error, String.t()}) :: boolean()
+  def assert_exit_code_zero({:ok, %{tests_failed: 0}}), do: true
+  def assert_exit_code_zero(_result), do: false
+
+  @doc """
+  Checks if test output contains expected patterns.
+
+  Validates that captured test output includes the given expected substring.
+  Returns true if the pattern is found, false otherwise.
+  """
+  @spec assert_test_output_contains({String.t(), integer(), String.t()}) :: boolean()
+  def assert_test_output_contains({output, exit_code, expected}) do
+    exit_code == 0 and String.contains?(to_string(output), expected)
   end
 
-  defp assert_test_output_contains({_output, _exit_code, expected}) do
-    # Utility for EEx templates
-    true
-  end
+  @doc """
+  Asserts that no test failures were detected.
 
-  defp assert_no_failures(result) do
-    assert_exit_code_zero(result)
-  end
+  Combines exit code and test result validation.
+  """
+  @spec assert_no_failures({:ok, map()} | {:error, String.t()}) :: boolean()
+  def assert_no_failures({:ok, %{tests_failed: 0, tests_passed: n}}) when n > 0, do: true
+  def assert_no_failures(_result), do: false
 end

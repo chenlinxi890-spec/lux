@@ -1,4 +1,4 @@
-defmodule Lux.RustTestRunnerTest do
+﻿defmodule Lux.RustTestRunnerTest do
   use ExUnit.Case, async: true
 
   doctest Lux.RustTestRunner
@@ -12,10 +12,74 @@ defmodule Lux.RustTestRunnerTest do
     end
   end
 
+  describe "resolve_cargo_project_path" do
+    test "returns error when no Cargo.toml found" do
+      # Since we don't have a Rust project in the test fixture, expect error
+      assert {:error, _reason} = Lux.RustTestRunner.resolve_cargo_project_path()
+    end
+  end
+
+  describe "assert_exit_code_zero" do
+    test "returns true for zero failures" do
+      result = {:ok, %{tests_failed: 0, tests_passed: 42}}
+      assert Lux.RustTestRunner.assert_exit_code_zero(result) == true
+    end
+
+    test "returns false for non-zero failures" do
+      result = {:ok, %{tests_failed: 3, tests_passed: 7}}
+      assert Lux.RustTestRunner.assert_exit_code_zero(result) == false
+    end
+
+    test "returns false for error tuple" do
+      result = {:error, "some error"}
+      assert Lux.RustTestRunner.assert_exit_code_zero(result) == false
+    end
+  end
+
+  describe "assert_test_output_contains" do
+    test "returns true when output contains expected string and exit is zero" do
+      result = {"test result: ok. 42 passed", 0, "42 passed"}
+      assert Lux.RustTestRunner.assert_test_output_contains(result) == true
+    end
+
+    test "returns false when output does not contain expected string" do
+      result = {"test result: ok. 42 passed", 0, "missing"}
+      assert Lux.RustTestRunner.assert_test_output_contains(result) == false
+    end
+
+    test "returns false when exit code is non-zero" do
+      result = {"test result: FAILED. 7 passed", 1, "7 passed"}
+      assert Lux.RustTestRunner.assert_test_output_contains(result) == false
+    end
+  end
+
+  describe "assert_no_failures" do
+    test "returns true when tests passed and failures are zero" do
+      result = {:ok, %{tests_failed: 0, tests_passed: 10}}
+      assert Lux.RustTestRunner.assert_no_failures(result) == true
+    end
+
+    test "returns false when failures are non-zero" do
+      result = {:ok, %{tests_failed: 2, tests_passed: 10}}
+      assert Lux.RustTestRunner.assert_no_failures(result) == false
+    end
+
+    test "returns false when no tests ran (passed is zero)" do
+      result = {:ok, %{tests_failed: 0, tests_passed: 0}}
+      assert Lux.RustTestRunner.assert_no_failures(result) == false
+    end
+
+    test "returns false for error tuple" do
+      result = {:error, "cargo not found"}
+      assert Lux.RustTestRunner.assert_no_failures(result) == false
+    end
+  end
+
   describe "create_fixture / load_fixture" do
     setup do
       on_exit fn ->
         fixture_file = Path.join([:code.priv_dir(:lux), "rust_test_fixtures", "test_fixture.json"])
+
         if File.exists?(fixture_file), do: File.rm!(fixture_file)
       end
     end
@@ -75,7 +139,7 @@ defmodule Lux.RustTestRunnerTest do
   end
 
   describe "parse_coverage_output" do
-    test "parses tarpaulin coverage percentage" do
+    test "parses tarpaulin coverage percentage with decimal" do
       output = """
       [tarpaulin] Coverage Results:
       Coverage : 85.7% (120/140 lines)
@@ -83,6 +147,16 @@ defmodule Lux.RustTestRunnerTest do
 
       result = Lux.RustTestRunner.parse_coverage_output(output)
       assert result.coverage_percentage == 85.7
+    end
+
+    test "parses tarpaulin coverage percentage as integer" do
+      output = """
+      [tarpaulin] Coverage Results:
+      Coverage : 85% (120/140 lines)
+      """
+
+      result = Lux.RustTestRunner.parse_coverage_output(output)
+      assert result.coverage_percentage == 85.0
     end
 
     test "handles missing coverage data" do
