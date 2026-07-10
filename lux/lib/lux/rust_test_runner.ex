@@ -200,7 +200,12 @@ defmodule Lux.RustTestRunner do
     coverage_pct =
       Regex.run(~r/Coverage\s*:\s*([\d.]+)%/, output)
       |> then(fn
-        [_, pct] -> String.to_float(pct)
+        [_, pct] ->
+          if String.contains?(pct, ".") do
+            String.to_float(pct)
+          else
+            String.to_integer(pct) * 1.0
+          end
         _ -> 0.0
       end)
 
@@ -238,8 +243,7 @@ defmodule Lux.RustTestRunner do
         :ok
 
       {:error, reason} ->
-        Logger.error("Failed to create fixture directory: #{inspect(reason)}")
-        :ok
+        {:error, "Failed to create fixture directory: #{inspect(reason)}"}
     end
   end
 
