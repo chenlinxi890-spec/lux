@@ -74,7 +74,7 @@
     `test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s`
   """
   @spec parse_cargo_output(String.t()) :: map()
-  defp parse_cargo_output(output) do
+  def parse_cargo_output(output) do
     # Standard cargo test result line: "test result: ok. N passed; M failed; ..."
     result_match = Regex.run(~r/test result: (ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed/, output)
 
@@ -113,7 +113,7 @@
     `Coverage : 85.7% (120/140 lines)`
   """
   @spec parse_coverage_output(String.t()) :: map()
-  defp parse_coverage_output(output) do
+  def parse_coverage_output(output) do
     # Try standard tarpaulin coverage percentage pattern
     coverage_pct =
       Regex.run(~r/Coverage\s*:\s*([\d.]+)%/, output)
