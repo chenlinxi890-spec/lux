@@ -1,4 +1,4 @@
-﻿defmodule Lux.RustTestRunnerTest do
+defmodule Lux.RustTestRunnerTest do
   use ExUnit.Case, async: true
 
   doctest Lux.RustTestRunner

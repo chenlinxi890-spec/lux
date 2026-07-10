@@ -1,4 +1,4 @@
-﻿defmodule Lux.RustTestRunner do
+defmodule Lux.RustTestRunner do
   @moduledoc """
   Rust Test Runner for Lux — Integration with mix test for bounty #102.
 

@@ -1,4 +1,4 @@
-﻿defmodule Mix.Tasks.Rust.Test do
+defmodule Mix.Tasks.Rust.Test do
   @shortdoc "Runs Rust tests via cargo test"
   @moduledoc """
   Runs Rust tests via `cargo test` and reports results.
