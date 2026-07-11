@@ -35,12 +35,12 @@ defmodule Lux.RustTestRunner do
   ### ExUnit Integration
 
   An ExUnit integration test in `test/integration/rust_test_runner_integration_test.exs
-  automatically calls Lux.RustTestRunner.run/0 as part of mix test,
+  automatically calls Lux.RustTestRunner.run() as part of mix test,
   ensuring Rust tests execute alongside Elixir tests.
 
   ## Cargo Project Resolution
 
-  The `run/1 and coverage/0 functions resolve the Rust project path
+  The `run/1` and `coverage/0` functions resolve the Rust project path
   from the Lux repository root. It searches:
 
   - lux/rust/ (subcrate)
@@ -60,7 +60,7 @@ defmodule Lux.RustTestRunner do
 
   ## Cross-Language Test Utilities
 
-  Available via     est_utils/0:
+  Available via `test_utils/0`:
 
       utils = RustTestRunner.test_utils()
       # => [:assert_exit_code_zero, :assert_test_output_contains, :assert_no_failures]

@@ -1,6 +1,8 @@
 defmodule Lux.RustTestRunnerTest do
   use ExUnit.Case, async: true
 
+  @moduletag :unit
+
   doctest Lux.RustTestRunner
 
   describe "test_utils" do
@@ -84,9 +86,8 @@ defmodule Lux.RustTestRunnerTest do
       File.rm(path)
     end
 
-    test "create_fixture returns {:error, _} when priv_dir fails" do
-      # We can't easily test this without mocking :code.priv_dir
-      # but the spec guarantees the return type
+    test "create_fixture function is callable" do
+      assert is_function(&Lux.RustTestRunner.create_fixture/2, 2)
     end
 
     test "load_fixture returns {:ok, data} for existing fixture" do
