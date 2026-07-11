@@ -60,7 +60,7 @@ defmodule Lux.RustTestRunner do
 
   ## Cross-Language Test Utilities
 
-  Available via 	est_utils/0:
+  Available via     est_utils/0:
 
       utils = RustTestRunner.test_utils()
       # => [:assert_exit_code_zero, :assert_test_output_contains, :assert_no_failures]
