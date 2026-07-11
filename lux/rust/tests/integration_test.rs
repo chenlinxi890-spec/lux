@@ -1,4 +1,4 @@
-﻿use lux_rust::{contains_zero_kanji, count_ascii_digits, sum_ascii_digits};
+use lux_rust::{contains_zero_kanji, count_ascii_digits, sum_ascii_digits};
 
 #[test]
 fn integration_test_contains_zero_kanji() {

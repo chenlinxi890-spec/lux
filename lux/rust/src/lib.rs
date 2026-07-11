@@ -1,4 +1,4 @@
-﻿/// Returns true if the input string contains the Kanji character for "zero" (é›¶).
+/// Returns true if the input string contains the Kanji character for "zero" (é›¶).
 pub fn contains_zero_kanji(input: &str) -> bool {
     input.chars().any(|c| c == '\u{96F6}')
 }
