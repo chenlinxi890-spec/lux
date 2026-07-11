@@ -11,10 +11,6 @@ defmodule Mix.Tasks.Rust.Test do
       mix rust.test
       mix rust.test Lux.Rust.TypeMappingTest
 
-  ## Options
-
-  - No options currently supported. Test names can be passed as positional args.
-
   ## Exit Codes
 
   - `0` — all Rust tests passed
@@ -23,9 +19,15 @@ defmodule Mix.Tasks.Rust.Test do
   ## Example
 
       $ mix rust.test
-      Running cargo test...
-      test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
-      Summary: 42 passed, 0 failed, duration: 0.12s
+      Running Rust tests via cargo test...
+
+      Rust Test Results:
+        Passed:  42
+        Failed:  0
+        Total:   42
+        Duration: 0.12s
+
+      All Rust tests passed.
   """
 
   use Mix.Task
@@ -34,13 +36,14 @@ defmodule Mix.Tasks.Rust.Test do
 
   @impl Mix.Task
   def run(args \\ []) do
-    Mix.shell().info("Running Rust tests via cargo test...\\n")
+    Mix.shell().info("Running Rust tests via cargo test...")
 
     case Lux.RustTestRunner.run(args) do
       {:ok, results} ->
         summary = Lux.RustTestRunner.summary(results)
         Mix.shell().info("""
-        \\nRust Test Results:
+
+Rust Test Results:
           Passed:  #{summary.passed}
           Failed:  #{summary.failed}
           Total:   #{summary.total}
@@ -51,8 +54,13 @@ defmodule Mix.Tasks.Rust.Test do
           Mix.shell().error("Some Rust tests failed.")
           exit({:shutdown, 1})
         else
-          Mix.shell().info("All Rust tests passed. \\u{2705}")
-          :ok
+          if summary.total == 0 do
+            Mix.shell().error("No Rust tests were found or executed.")
+            exit({:shutdown, 1})
+          else
+            Mix.shell().info("All Rust tests passed.")
+            :ok
+          end
         end
 
       {:error, reason} ->

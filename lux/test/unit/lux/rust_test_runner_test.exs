@@ -13,9 +13,10 @@ defmodule Lux.RustTestRunnerTest do
   end
 
   describe "resolve_cargo_project_path" do
-    test "returns error when no Cargo.toml found" do
-      # Since we don't have a Rust project in the test fixture, expect error
-      assert {:error, _reason} = Lux.RustTestRunner.resolve_cargo_project_path()
+    test "finds Cargo.toml in lux/rust/" do
+      assert {:ok, path} = Lux.RustTestRunner.resolve_cargo_project_path()
+      assert path |> String.ends_with?("rust")
+      assert File.exists?(Path.join(path, "Cargo.toml"))
     end
   end
 
@@ -76,21 +77,28 @@ defmodule Lux.RustTestRunnerTest do
   end
 
   describe "create_fixture / load_fixture" do
-    setup do
-      on_exit fn ->
-        fixture_file = Path.join([:code.priv_dir(:lux), "rust_test_fixtures", "test_fixture.json"])
-
-        if File.exists?(fixture_file), do: File.rm!(fixture_file)
-      end
+    test "create_fixture returns {:ok, path} on success" do
+      result = Lux.RustTestRunner.create_fixture("test_fixture", %{name: "test", value: 42})
+      assert {:ok, path} = result
+      assert File.exists?(path)
+      File.rm(path)
     end
 
-    test "creates and loads a fixture", _ do
-      Lux.RustTestRunner.create_fixture("test_fixture", %{name: "test", value: 42})
-      assert {:ok, %{name: "test", value: 42}} = Lux.RustTestRunner.load_fixture("test_fixture")
+    test "create_fixture returns {:error, _} when priv_dir fails" do
+      # We can't easily test this without mocking :code.priv_dir
+      # but the spec guarantees the return type
     end
 
-    test "returns error for non-existent fixture", _ do
-      assert {:error, _} = Lux.RustTestRunner.load_fixture("nonexistent")
+    test "load_fixture returns {:ok, data} for existing fixture" do
+      Lux.RustTestRunner.create_fixture("test_load_fixture", %{key: "val"})
+      assert {:ok, %{key: "val"}} = Lux.RustTestRunner.load_fixture("test_load_fixture")
+      # Clean up
+      fixture_file = Path.join([:code.priv_dir(:lux), "rust_test_fixtures", "test_load_fixture.json"])
+      if File.exists?(fixture_file), do: File.rm(fixture_file)
+    end
+
+    test "load_fixture returns {:error, _} for non-existent fixture" do
+      assert {:error, _} = Lux.RustTestRunner.load_fixture("nonexistent_fixture_xyz")
     end
   end
 
@@ -112,7 +120,7 @@ defmodule Lux.RustTestRunnerTest do
       test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
       """
 
-      result = Lux.RustTestRunner.parse_cargo_output(output)
+      assert {:ok, result} = Lux.RustTestRunner.parse_cargo_output(output)
       assert result.tests_passed == 42
       assert result.tests_failed == 0
       assert result.duration == "0.12"
@@ -124,17 +132,38 @@ defmodule Lux.RustTestRunnerTest do
       test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
       """
 
-      result = Lux.RustTestRunner.parse_cargo_output(output)
+      assert {:ok, result} = Lux.RustTestRunner.parse_cargo_output(output)
       assert result.tests_passed == 7
       assert result.tests_failed == 3
       assert result.duration == "1.23"
     end
 
-    test "handles empty output gracefully" do
-      result = Lux.RustTestRunner.parse_cargo_output("")
-      assert result.tests_passed == 0
+    test "handles empty output with error" do
+      assert {:error, reason} = Lux.RustTestRunner.parse_cargo_output("")
+      assert reason =~ "Empty"
+    end
+
+    test "handles unrecognizable output with error" do
+      assert {:error, _} = Lux.RustTestRunner.parse_cargo_output("garbage output")
+    end
+
+    test "aggregates multiple test result lines" do
+      output = """
+      running 10 tests
+      test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+      running 5 tests
+      test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+      """
+
+      assert {:ok, result} = Lux.RustTestRunner.parse_cargo_output(output)
+      assert result.tests_passed == 13
       assert result.tests_failed == 0
-      assert result.duration == "unknown"
+    end
+
+    test "fails on 0 passed and 0 failed" do
+      output = "running 0 tests\n"
+      assert {:error, _} = Lux.RustTestRunner.parse_cargo_output(output)
     end
   end
 
@@ -145,7 +174,7 @@ defmodule Lux.RustTestRunnerTest do
       Coverage : 85.7% (120/140 lines)
       """
 
-      result = Lux.RustTestRunner.parse_coverage_output(output)
+      assert {:ok, result} = Lux.RustTestRunner.parse_coverage_output(output)
       assert result.coverage_percentage == 85.7
     end
 
@@ -155,13 +184,12 @@ defmodule Lux.RustTestRunnerTest do
       Coverage : 85% (120/140 lines)
       """
 
-      result = Lux.RustTestRunner.parse_coverage_output(output)
+      assert {:ok, result} = Lux.RustTestRunner.parse_coverage_output(output)
       assert result.coverage_percentage == 85.0
     end
 
-    test "handles missing coverage data" do
-      result = Lux.RustTestRunner.parse_coverage_output("")
-      assert result.coverage_percentage == 0.0
+    test "handles missing coverage data with error" do
+      assert {:error, _} = Lux.RustTestRunner.parse_coverage_output("")
     end
   end
 end

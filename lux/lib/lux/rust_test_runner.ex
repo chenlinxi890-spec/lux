@@ -1,8 +1,8 @@
 defmodule Lux.RustTestRunner do
   @moduledoc """
-  Rust Test Runner for Lux — Integration with mix test for bounty #102.
+  Rust Test Runner for Lux - Integration with mix test for bounty #102.
 
-  Provides a Rust test runner that integrates with the existing
+  Provides a complete Rust test runner that integrates with the existing
   Elixir test infrastructure, with coverage reporting,
   cross-language test utilities, and test fixtures.
 
@@ -14,7 +14,7 @@ defmodule Lux.RustTestRunner do
       {:ok, results} = RustTestRunner.run()
 
       # Run specific test module
-      {:ok, results} = RustTestRunner.run(["Lux.Rust.TypeMappingTest"])
+      {:ok, results} = RustTestRunner.run(["--test", "some_test"])
 
       # Run with coverage
       {:ok, coverage} = RustTestRunner.coverage()
@@ -24,26 +24,76 @@ defmodule Lux.RustTestRunner do
 
   ## Mix Integration
 
-  This module is designed to be invoked via `mix test` through the
-  ExUnit integration in `Lux.RustTestRunnerTest`. For direct CLI usage,
-  implement a `Mix.Task.rust_test` module that delegates to `run/1`.
+  ### Independent Mix Task
 
-      # Example Mix.Task integration (to be added separately):
-      # defmodule Mix.Tasks.RustTest do
-      #   use Mix.Task
-      #   def run(args) do
-      #     {:ok, results} = Lux.RustTestRunner.run(args)
-      #     Lux.RustTestRunner.summary(results)
-      #     |> IO.inspect()
-      #   end
-      # end
+  Run Rust tests independently via:
+
+      mix rust.test
+
+  This invokes Lux.RustTestRunner.run/1 through Mix.Tasks.Rust.Test.
+
+  ### ExUnit Integration
+
+  An ExUnit integration test in `test/integration/rust_test_runner_integration_test.exs
+  automatically calls Lux.RustTestRunner.run/0 as part of mix test,
+  ensuring Rust tests execute alongside Elixir tests.
 
   ## Cargo Project Resolution
 
-  The `run/1` and `coverage/0` functions resolve the Rust project path
-  from the Lux repository root. If no Cargo.toml is found in the
-  expected locations, an error is returned.
+  The `run/1 and coverage/0 functions resolve the Rust project path
+  from the Lux repository root. It searches:
 
+  - lux/rust/ (subcrate)
+  - priv/rust/ (priv Rust project)
+
+  Returns {:ok, path} if Cargo.toml is found, {:error, reason} otherwise.
+
+  ## Coverage Reporting
+
+  Uses cargo-tarpaulin for coverage. Install with:
+
+      cargo install cargo-tarpaulin
+
+  Run coverage:
+
+      RustTestRunner.coverage()
+
+  ## Cross-Language Test Utilities
+
+  Available via 	est_utils/0:
+
+      utils = RustTestRunner.test_utils()
+      # => [:assert_exit_code_zero, :assert_test_output_contains, :assert_no_failures]
+
+  ## Test Fixtures
+
+  Create and load JSON fixtures:
+
+      RustTestRunner.create_fixture("my_fixture", %{key: "value"})
+      {:ok, data} = RustTestRunner.load_fixture("my_fixture")
+
+  ## Rust Test Example
+
+  A minimal Rust crate is included at lux/rust/:
+
+      // lux/rust/src/lib.rs
+      pub fn add(a: i32, b: i32) -> i32 {
+          a + b
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn test_add() {
+              assert_eq!(add(2, 3), 5);
+          }
+      }
+
+  Run with:
+
+      mix rust.test
   """
 
   require Logger
@@ -60,8 +110,13 @@ defmodule Lux.RustTestRunner do
                stderr_to_stdout: true
              ) do
           {output, 0} ->
-            parsed = parse_cargo_output(output)
-            {:ok, parsed}
+            case parse_cargo_output(output) do
+              {:ok, parsed} ->
+                {:ok, parsed}
+
+              {:error, reason} ->
+                {:error, "Cargo returned 0 but output could not be parsed: #{reason}"}
+            end
 
           {output, exit_code} ->
             Logger.error("Rust tests failed with exit code #{exit_code}")
@@ -79,7 +134,6 @@ defmodule Lux.RustTestRunner do
   def coverage do
     case resolve_cargo_project_path() do
       {:ok, project_path} ->
-        # Check if cargo-tarpaulin is available
         case System.cmd("cargo", ["tarpaulin", "--version"],
                cd: project_path,
                stderr_to_stdout: true
@@ -87,23 +141,21 @@ defmodule Lux.RustTestRunner do
           {_output, 0} ->
             cmd_args = [
               "tarpaulin",
-              "--out",
-              "Xml",
-              "--out",
-              "Html",
-              "--engine",
-              "llvm",
+              "--out", "Xml",
+              "--out", "Html",
+              "--engine", "llvm",
               "--follow-tests",
-              "--timeout",
-              "120"
+              "--timeout", "120"
             ]
 
             case System.cmd("cargo", cmd_args,
                    cd: project_path, stderr_to_stdout: true
                  ) do
               {output, 0} ->
-                coverage = parse_coverage_output(output)
-                {:ok, coverage}
+                case parse_coverage_output(output) do
+                  {:ok, cov} -> {:ok, cov}
+                  {:error, reason} -> {:error, "Coverage parsing failed: #{reason}"}
+                end
 
               {output, exit_code} ->
                 {:error,
@@ -125,80 +177,99 @@ defmodule Lux.RustTestRunner do
   Searches common locations for Cargo.toml:
   - lux/rust/ (subcrate)
   - priv/rust/ (priv Rust project)
-  - . (repository root)
 
   Returns {:ok, path} if found, {:error, reason} otherwise.
   """
   @spec resolve_cargo_project_path() :: {:ok, String.t()} | {:error, String.t()}
   def resolve_cargo_project_path do
-    # Try common Rust project locations within the Lux repo
-    candidates = [
-      Path.join(__DIR__, "../../rust"),
-      Path.join(__DIR__, "../../../priv/rust"),
-      Path.join(__DIR__, "../../../..")
-    ]
+    # __DIR__ = lux/lib/lux/
+    # Target = lux/rust/ (relative to repo root = lux/)
+    # From __DIR__: ../../rust
+    base = Path.join([__DIR__, "../../rust"])
+    cargo_toml = Path.join(base, "Cargo.toml")
 
-    Enum.find_value(candidates, {:error, "No Cargo.toml found in expected locations"}) do
-      path ->
-        cargo_toml = Path.join(path, "Cargo.toml")
-        if File.exists?(cargo_toml), do: {:ok, path}, else: nil
+    case File.exists?(cargo_toml) do
+      true -> {:ok, base}
+      false ->
+        priv_path = Path.join([__DIR__, "../../priv/rust"])
+        priv_cargo = Path.join(priv_path, "Cargo.toml")
+        case File.exists?(priv_cargo) do
+          true -> {:ok, priv_path}
+          false -> {:error, "No Cargo.toml found in lux/rust/ or priv/rust/"}
+        end
     end
   end
 
   @doc """
-  Parses standard `cargo test` output.
+  Parses standard cargo test output.
 
   Matches patterns like:
-    `test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s`
+    test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+  Returns {:ok, parsed_map} on success, {:error, reason} when output cannot be parsed
+  or represents 0 tests (which indicates cargo failed to find/run any tests).
+
+  Multiple test result lines from different targets are aggregated.
   """
-  @spec parse_cargo_output(String.t()) :: map()
+  @spec parse_cargo_output(String.t()) :: {:ok, map()} | {:error, String.t()}
   def parse_cargo_output(output) do
-    # Standard cargo test result line: "test result: ok. N passed; M failed; ..."
-    result_match =
-      Regex.run(
-        ~r/test result: (ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed/,
-        output
-      )
+    matches = Regex.scan(~r/test result: (ok|FAILED)\\.\\s+(\\d+) passed;\\s+(\\d+) failed/, output)
 
-    passed =
-      case result_match do
-        [_, _, passed_str, _] -> String.to_integer(passed_str)
-        nil -> 0
+    if matches == [] do
+      trimmed = String.trim(output)
+      cond do
+        trimmed == "" ->
+          {:error, "Empty cargo test output - no tests ran or cargo failed"}
+
+        String.contains?(trimmed, "FAILED") ->
+          {:error, "Cargo test output contains FAILED but no parseable test result line"}
+
+        true ->
+          {:error, "Unrecognized cargo test output format: #{String.slice(trimmed, 0, 200)}"}
       end
-
-    failed =
-      case result_match do
-        [_, _, _, failed_str] -> String.to_integer(failed_str)
-        nil -> 0
-      end
-
-    # Duration: "finished in Xs" or "finished in Xm Ys"
-    duration =
-      Regex.run(~r/finished in ([\d.]+)s/, output)
-      |> then(fn
-        [_, d] -> d
-        _ -> "unknown"
+    else
+      total_passed = Enum.reduce(matches, 0, fn [_, _, passed_str, _], acc ->
+        acc + String.to_integer(passed_str)
       end)
 
-    %{
-      tests_passed: passed,
-      tests_failed: failed,
-      duration: duration,
-      output: String.trim(output)
-    }
+      total_failed = Enum.reduce(matches, 0, fn [_, _, _, failed_str], acc ->
+        acc + String.to_integer(failed_str)
+      end)
+
+      duration =
+        Regex.scan(~r/finished in ([\\d.]+)s/, output)
+        |> then(fn
+          [] -> "unknown"
+          [[_, d]] -> d
+          _ -> "unknown"
+        end)
+
+      if total_passed + total_failed == 0 do
+        {:error, "Parsed 0 tests total (passed: #{total_passed}, failed: #{total_failed}) - cargo found no tests to run"}
+      else
+        {:ok, %{
+          tests_passed: total_passed,
+          tests_failed: total_failed,
+          duration: duration,
+          output: String.trim(output)
+        }}
+      end
+    end
   end
 
   @doc """
   Parses cargo-tarpaulin coverage output.
 
   Matches patterns like:
-    `Coverage : 85.7% (120/140 lines)`
+    Coverage : 85.7% (120/140 lines)
+
+  Supports both integer (85%) and decimal (85.7%) percentages.
+  Returns {:ok, map} on success, {:error, reason} if parsing fails.
   """
-  @spec parse_coverage_output(String.t()) :: map()
+  @spec parse_coverage_output(String.t()) :: {:ok, map()} | {:error, String.t()}
   def parse_coverage_output(output) do
-    # Try standard tarpaulin coverage percentage pattern
     coverage_pct =
-      Regex.run(~r/Coverage\s*:\s*([\d.]+)%/, output)
+      Regex.run(~r/Coverage\\s*:\\s*([\\d.]+)%/, output)
       |> then(fn
         [_, pct] ->
           if String.contains?(pct, ".") do
@@ -206,13 +277,13 @@ defmodule Lux.RustTestRunner do
           else
             String.to_integer(pct) * 1.0
           end
-        _ -> 0.0
+        _ -> nil
       end)
 
-    %{
-      coverage_percentage: coverage_pct,
-      output: String.trim(output)
-    }
+    case coverage_pct do
+      nil -> {:error, "No coverage percentage found in output"}
+      pct -> {:ok, %{coverage_percentage: pct, output: String.trim(output)}}
+    end
   end
 
   @doc "Returns a test summary map."
@@ -232,28 +303,36 @@ defmodule Lux.RustTestRunner do
   end
 
   @doc "Creates a test fixture for Rust integration testing."
-  @spec create_fixture(String.t(), map()) :: :ok
+  @spec create_fixture(String.t(), map()) :: {:ok, String.t()} | {:error, String.t()}
   def create_fixture(name, data \\ %{}) do
-    fixture_dir = Path.join([:code.priv_dir(:lux), "rust_test_fixtures"])
-
-    case File.mkdir_p(fixture_dir) do
-      :ok ->
-        fixture_file = Path.join(fixture_dir, "#{name}.json")
-        File.write!(fixture_file, Jason.encode!(data, pretty: true))
-        :ok
-
+    case :code.priv_dir(:lux) do
       {:error, reason} ->
-        {:error, "Failed to create fixture directory: #{inspect(reason)}"}
+        {:error, "Cannot determine priv dir for :lux: #{inspect(reason)}"}
+
+      priv_path ->
+        fixture_dir = Path.join([priv_path, "rust_test_fixtures"])
+
+        case File.mkdir_p(fixture_dir) do
+          :ok ->
+            fixture_file = Path.join(fixture_dir, "#{name}.json")
+            case File.write(fixture_file, Jason.encode!(data, pretty: true)) do
+              :ok -> {:ok, fixture_file}
+              {:error, write_reason} -> {:error, "Failed to write fixture: #{write_reason}"}
+            end
+
+          {:error, mkdir_reason} ->
+            {:error, "Failed to create fixture directory: #{inspect(mkdir_reason)}"}
+        end
     end
   end
 
   @doc "Loads a test fixture by name."
   @spec load_fixture(String.t()) :: {:ok, map()} | {:error, String.t()}
   def load_fixture(name) do
-    fixture_dir = :code.priv_dir(:lux)
+    fixture_dir_result = :code.priv_dir(:lux)
 
     fixture_file =
-      case fixture_dir do
+      case fixture_dir_result do
         {:error, _} ->
           Path.join(["rust_test_fixtures", "#{name}.json"])
 
@@ -262,8 +341,14 @@ defmodule Lux.RustTestRunner do
       end
 
     case File.read(fixture_file) do
-      {:ok, content} -> {:ok, Jason.decode!(content)}
-      {:error, _} -> {:error, "Fixture not found: #{name}"}
+      {:ok, content} ->
+        case Jason.decode(content) do
+          {:ok, data} -> {:ok, data}
+          {:error, decode_reason} -> {:error, "Failed to decode fixture JSON: #{decode_reason}"}
+        end
+
+      {:error, read_reason} ->
+        {:error, "Fixture not found: #{name} (#{inspect(read_reason)})"}
     end
   end
 
@@ -286,7 +371,7 @@ defmodule Lux.RustTestRunner do
   Checks if test output contains expected patterns.
 
   Validates that captured test output includes the given expected substring.
-  Returns true if the pattern is found, false otherwise.
+  Returns true if the pattern is found and exit code is zero, false otherwise.
   """
   @spec assert_test_output_contains({String.t(), integer(), String.t()}) :: boolean()
   def assert_test_output_contains({output, exit_code, expected}) do
@@ -297,6 +382,7 @@ defmodule Lux.RustTestRunner do
   Asserts that no test failures were detected.
 
   Combines exit code and test result validation.
+  Returns true only when tests_passed > 0 and tests_failed == 0.
   """
   @spec assert_no_failures({:ok, map()} | {:error, String.t()}) :: boolean()
   def assert_no_failures({:ok, %{tests_failed: 0, tests_passed: n}}) when n > 0, do: true
