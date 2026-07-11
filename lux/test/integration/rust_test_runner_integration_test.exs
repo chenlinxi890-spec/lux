@@ -1,7 +1,7 @@
 defmodule Lux.RustTestRunnerIntegrationTest do
   use ExUnit.Case, async: false
 
-  @moduletag [:rust_integration, :integration]
+  @moduletag :rust_integration
 
   setup do
     if System.find_executable("cargo") do
