@@ -79,7 +79,12 @@ defmodule Lux.LLM.Ollama do
   @perf_key {:lux_ollama_perf, __MODULE__}
 
   @doc "Records a performance metric entry."
-  @spec record_perf(model :: String.t(), prompt_tokens :: integer(), output_tokens :: integer(), duration_ms :: integer()) :: :ok
+  @spec record_perf(
+          model :: String.t(),
+          prompt_tokens :: integer(),
+          output_tokens :: integer(),
+          duration_ms :: integer()
+        ) :: :ok
   def record_perf(model, prompt_tokens, output_tokens, duration_ms) do
     entry = %{
       model: model,
@@ -88,6 +93,7 @@ defmodule Lux.LLM.Ollama do
       duration_ms: duration_ms,
       timestamp: DateTime.utc_now()
     }
+
     current = :persistent_term.get(@perf_key, [])
     :persistent_term.put(@perf_key, [entry | current])
     :ok
@@ -113,10 +119,12 @@ defmodule Lux.LLM.Ollama do
   @spec perf_summary() :: map()
   def perf_summary do
     metrics = performance_metrics()
+
     if Enum.empty?(metrics) do
       %{total_requests: 0, avg_duration_ms: 0, avg_prompt_tokens: 0, avg_output_tokens: 0}
     else
       total = length(metrics)
+
       %{
         total_requests: total,
         avg_duration_ms: Enum.sum(Enum.map(metrics, & &1.duration_ms)) / total,
@@ -145,16 +153,45 @@ defmodule Lux.LLM.Ollama do
     end
   end
 
-  defp tool_to_function(%Lux.Beam{module_name: name, description: description, input_schema: input_schema}) do
-    %{type: "function", function: %{name: String.replace(name, ".", "_"), description: description || "", parameters: input_schema}}
+  defp tool_to_function(%Lux.Beam{
+         module_name: name,
+         description: description,
+         input_schema: input_schema
+       }) do
+    %{
+      type: "function",
+      function: %{
+        name: String.replace(name, ".", "_"),
+        description: description || "",
+        parameters: input_schema
+      }
+    }
   end
 
-  defp tool_to_function(%Lux.Prism{module_name: name, description: description, input_schema: input_schema}) do
-    %{type: "function", function: %{name: String.replace(name, ".", "_"), description: description || "", parameters: input_schema}}
+  defp tool_to_function(%Lux.Prism{
+         module_name: name,
+         description: description,
+         input_schema: input_schema
+       }) do
+    %{
+      type: "function",
+      function: %{
+        name: String.replace(name, ".", "_"),
+        description: description || "",
+        parameters: input_schema
+      }
+    }
   end
 
   defp tool_to_function(%Lux.Lens{module_name: name, description: description, schema: schema}) do
-    %{type: "function", function: %{name: String.replace(name, ".", "_"), description: description || "", parameters: schema}}
+    %{
+      type: "function",
+      function: %{
+        name: String.replace(name, ".", "_"),
+        description: description || "",
+        parameters: schema
+      }
+    }
   end
 
   defp tool_to_function(_), do: []
@@ -163,10 +200,14 @@ defmodule Lux.LLM.Ollama do
 
   @impl true
   def call(prompt, tools, config) when is_list(tools) do
-    config = struct(Config, Map.merge(
-      %{api_key: Application.get_env(:lux, :api_keys, [])[:ollama]},
-      Keyword.into(Map.to_list(config || %{}), %{})
-    ))
+    config =
+      struct(
+        Config,
+        Map.merge(
+          %{api_key: Application.get_env(:lux, :api_keys, [])[:ollama]},
+          Keyword.into(Map.to_list(config || %{}), %{})
+        )
+      )
 
     system_prompt = config.system || "You are a helpful AI assistant powered by Ollama."
 
@@ -208,6 +249,7 @@ defmodule Lux.LLM.Ollama do
       [user_content]
     else
       tool_defs = build_tools_config(tools)
+
       if Enum.empty?(tool_defs) do
         [user_content]
       else
@@ -215,8 +257,9 @@ defmodule Lux.LLM.Ollama do
         You have access to the following tools. When appropriate, use them to help answer the user's question.
 
         Tool definitions:
-        #{Enum.map_join(tool_defs, "\n", &Jason.encode!(&1) |> String.trim_leading("{") |> String.trim_trailing("}"))}
+        #{Enum.map_join(tool_defs, "\n", &(Jason.encode!(&1) |> String.trim_leading("{") |> String.trim_trailing("}")))}
         """
+
         [
           %{role: "system", content: tool_instruction},
           user_content
@@ -239,14 +282,22 @@ defmodule Lux.LLM.Ollama do
   end
 
   defp do_call(url, payload, headers, config) do
-    case Req.post(url, json: payload, headers: headers, timeout: config.timeout, recv_timeout: config.timeout) do
+    case Req.post(url,
+           json: payload,
+           headers: headers,
+           timeout: config.timeout,
+           recv_timeout: config.timeout
+         ) do
       {:ok, %{status: 200, body: body}} -> {:ok, body}
       {:ok, %{status: status, body: body}} -> {:error, "HTTP #{status}: #{inspect(body)}"}
       {:error, reason} -> {:error, inspect(reason)}
     end
   end
 
-  defp handle_ollama_response(%{"message" => %{"content" => content, "tool_calls" => tool_calls}} = resp, _config) do
+  defp handle_ollama_response(
+         %{"message" => %{"content" => content, "tool_calls" => tool_calls}} = resp,
+         _config
+       ) do
     metadata = %{
       model: Map.get(resp, "model"),
       prompt_tokens: Map.get(resp, "prompt_eval_count"),
@@ -259,7 +310,8 @@ defmodule Lux.LLM.Ollama do
     {:ok, Lux.Signal.new(%{}, signal)}
   end
 
-  defp handle_ollama_response(%{"message" => %{"content" => content}}, _config) when is_binary(content) do
+  defp handle_ollama_response(%{"message" => %{"content" => content}}, _config)
+       when is_binary(content) do
     {:ok, Lux.Signal.new(%{content: content}, ResponseSignal, %{provider: :ollama})}
   end
 
@@ -319,8 +371,10 @@ defmodule Lux.LLM.Ollama do
     case Req.get(url) do
       {:ok, %{status: 200, body: %{"models" => models}}} ->
         {:ok, Enum.map(models, &parse_model/1)}
+
       {:ok, %{status: status}} ->
         {:error, "Failed to list models: HTTP #{status}"}
+
       {:error, reason} ->
         {:error, "Failed to connect to Ollama: #{inspect(reason)}"}
     end
@@ -345,9 +399,14 @@ defmodule Lux.LLM.Ollama do
     payload = %{name: model_name, stream: false}
 
     case Req.post(url, json: payload) do
-      {:ok, %{status: 200, body: body}} -> {:ok, body}
-      {:ok, %{status: status, body: body}} -> {:error, "Pull failed: HTTP #{status}: #{inspect(body)}"}
-      {:error, reason} -> {:error, "Pull failed: #{inspect(reason)}"}
+      {:ok, %{status: 200, body: body}} ->
+        {:ok, body}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, "Pull failed: HTTP #{status}: #{inspect(body)}"}
+
+      {:error, reason} ->
+        {:error, "Pull failed: #{inspect(reason)}"}
     end
   end
 
@@ -360,8 +419,12 @@ defmodule Lux.LLM.Ollama do
     payload = %{name: model_name, stream: true}
 
     case Req.post(url, json: payload, recv: :stream) do
-      {:ok, %{status: 200}} = resp -> {:ok, Stream.resource(fn -> resp do -> resp end, fn -> fn acc -> acc end end, fn _ -> :ok end)}
-      {:error, reason} -> {:error, "Pull failed: #{inspect(reason)}"}
+      {:ok, %{status: 200}} = resp ->
+        {:ok,
+         Stream.resource(fn -> resp end, fn resp -> fn chunk -> chunk end end, fn _ -> :ok end)}
+
+      {:error, reason} ->
+        {:error, "Pull failed: #{inspect(reason)}"}
     end
   end
 
