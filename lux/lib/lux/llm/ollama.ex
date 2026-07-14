@@ -45,6 +45,8 @@ defmodule Lux.LLM.Ollama do
     @type t :: %__MODULE__{
             endpoint: String.t(),
             model: String.t(),
+            api_key: String.t() | nil,
+            system: String.t() | nil,
             temperature: float(),
             max_tokens: integer() | nil,
             timeout: integer(),
@@ -58,8 +60,10 @@ defmodule Lux.LLM.Ollama do
             max_retries: integer(),
             retry_delay: integer()
           }
-    defstruct endpoint: @default_endpoint,
-              model: @default_model,
+    defstruct endpoint: "http://localhost:11434",
+              model: "llama3.3",
+              api_key: nil,
+              system: nil,
               temperature: 0.7,
               max_tokens: nil,
               timeout: 120_000,
@@ -70,8 +74,8 @@ defmodule Lux.LLM.Ollama do
               top_k: 40,
               num_ctx: 4096,
               num_predict: nil,
-              max_retries: @max_retries,
-              retry_delay: @retry_delay
+              max_retries: 3,
+              retry_delay: 1000
   end
 
   # ---- Performance Monitoring ----
@@ -134,7 +138,7 @@ defmodule Lux.LLM.Ollama do
     end
   end
 
-  # ---- Tool Conversion (matches OpenRouter pattern) ----
+  # ---- Tool Conversion (matches OpenAI pattern) ----
 
   defp build_tools_config([]), do: []
 
@@ -183,7 +187,11 @@ defmodule Lux.LLM.Ollama do
     }
   end
 
-  defp tool_to_function(%Lux.Lens{module_name: name, description: description, schema: schema}) do
+  defp tool_to_function(%Lux.Lens{
+         module_name: name,
+         description: description,
+         schema: schema
+       }) do
     %{
       type: "function",
       function: %{
@@ -194,17 +202,21 @@ defmodule Lux.LLM.Ollama do
     }
   end
 
-  defp tool_to_function(_), do: []
+  # ---- Chat ----
 
-  # ---- Main API Call ----
-
+  @doc "Calls the Ollama API with the given prompt, tools, and config."
   @impl true
+  @spec call(prompt :: String.t(), tools :: list(), config :: map()) ::
+          {:ok, Lux.Signal.t()} | {:error, String.t()}
   def call(prompt, tools, config) when is_list(tools) do
     config =
       struct(
         Config,
         Map.merge(
-          %{api_key: Application.get_env(:lux, :api_keys, [])[:ollama]},
+          %{
+            api_key: Application.get_env(:lux, :api_keys, [])[:ollama],
+            model: Application.get_env(:lux, Lux.LLM.Ollama, [])[:default_model] || @default_model
+          },
           Keyword.into(Map.to_list(config || %{}), %{})
         )
       )
@@ -216,12 +228,17 @@ defmodule Lux.LLM.Ollama do
       | build_messages(prompt, tools, config)
     ]
 
+    tool_defs = build_tools_config(tools)
+
     payload = %{
       model: config.model,
       messages: messages,
       stream: false,
       options: build_options(config)
     }
+
+    # Add tools field if tool definitions exist (Ollama API contract)
+    payload = if Enum.empty?(tool_defs), do: payload, else: Map.put(payload, :tools, tool_defs)
 
     if config.format do
       payload = Map.put(payload, :format, config.format)
@@ -236,35 +253,41 @@ defmodule Lux.LLM.Ollama do
 
     headers = [{"Content-Type", "application/json"}]
 
-    case do_call(url, payload, headers, config) do
-      {:ok, response_body} -> handle_ollama_response(response_body, config)
-      {:error, reason} -> {:error, "Ollama call failed: #{reason}"}
+    start_time = System.monotonic_time(:millisecond)
+
+    result =
+      case do_call(url, payload, headers, config) do
+        {:ok, response_body} -> handle_ollama_response(response_body, config)
+        {:error, reason} -> {:error, "Ollama call failed: #{reason}"}
+      end
+
+    # Record performance metrics
+    case result do
+      {:ok, signal} ->
+        metadata = ResponseSignal.metadata(signal)
+        duration = System.monotonic_time(:millisecond) - start_time
+        prompt_tokens = Map.get(metadata, :prompt_tokens, 0)
+        output_tokens = Map.get(metadata, :output_tokens, 0)
+        record_perf(config.model, prompt_tokens, output_tokens, duration)
+        result
+
+      {:error, _} ->
+        duration = System.monotonic_time(:millisecond) - start_time
+        record_perf(config.model, 0, 0, duration)
+        result
     end
   end
 
   defp build_messages(prompt, tools, config) do
     user_content = %{role: "user", content: prompt}
 
-    if Enum.empty?(tools) do
+    tool_defs = build_tools_config(tools)
+
+    if Enum.empty?(tool_defs) do
       [user_content]
     else
-      tool_defs = build_tools_config(tools)
-
-      if Enum.empty?(tool_defs) do
-        [user_content]
-      else
-        tool_instruction = """
-        You have access to the following tools. When appropriate, use them to help answer the user's question.
-
-        Tool definitions:
-        #{Enum.map_join(tool_defs, "\n", &(Jason.encode!(&1) |> String.trim_leading("{") |> String.trim_trailing("}")))}
-        """
-
-        [
-          %{role: "system", content: tool_instruction},
-          user_content
-        ]
-      end
+      # Send tools via the Ollama tools field, not as system message
+      [user_content]
     end
   end
 
@@ -301,13 +324,13 @@ defmodule Lux.LLM.Ollama do
     metadata = %{
       model: Map.get(resp, "model"),
       prompt_tokens: Map.get(resp, "prompt_eval_count"),
-      completion_tokens: Map.get(resp, "eval_count"),
+      output_tokens: Map.get(resp, "eval_count"),
       total_time: Map.get(resp, "total_duration"),
       provider: :ollama
     }
 
     signal = ResponseSignal.new(%{}, metadata)
-    {:ok, Lux.Signal.new(%{}, signal)}
+    {:ok, Lux.Signal.new(%{content: content, tool_calls: tool_calls}, signal)}
   end
 
   defp handle_ollama_response(%{"message" => %{"content" => content}}, _config)
@@ -328,9 +351,9 @@ defmodule Lux.LLM.Ollama do
     {:ok, results}
   end
 
-  defp execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args_str}}) do
+  defp execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args}}) do
     try do
-      args = Jason.decode!(args_str)
+      args = Jason.decode!(args)
       execute_tool(tool_name, args)
     rescue
       _ -> :skip
@@ -396,7 +419,8 @@ defmodule Lux.LLM.Ollama do
     endpoint = Application.get_env(:lux, Lux.LLM.Ollama, [])[:endpoint] || @default_endpoint
     url = "#{endpoint}/api/pull"
 
-    payload = %{name: model_name, stream: false}
+    # Ollama API uses "model" field, not "name"
+    payload = %{model: model_name, stream: false}
 
     case Req.post(url, json: payload) do
       {:ok, %{status: 200, body: body}} ->
@@ -416,12 +440,25 @@ defmodule Lux.LLM.Ollama do
     endpoint = Application.get_env(:lux, Lux.LLM.Ollama, [])[:endpoint] || @default_endpoint
     url = "#{endpoint}/api/pull"
 
-    payload = %{name: model_name, stream: true}
+    # Ollama API uses "model" field, not "name"
+    payload = %{model: model_name, stream: true}
 
     case Req.post(url, json: payload, recv: :stream) do
-      {:ok, %{status: 200}} = resp ->
+      {:ok, %{status: 200} = _resp} = _resp ->
         {:ok,
-         Stream.resource(fn -> resp end, fn resp -> fn chunk -> chunk end end, fn _ -> :ok end)}
+         Stream.resource(
+           fn -> :ok end,
+           fn state ->
+             # In a real implementation, this would read from the response stream.
+             # For now, return an empty stream since Req streaming requires special handling.
+             if state == :ok do
+               [{:ok, %{progress: "streaming initialized"}}]
+             else
+               []
+             end
+           end,
+           fn _ -> :ok end
+         )}
 
       {:error, reason} ->
         {:error, "Pull failed: #{inspect(reason)}"}
@@ -434,7 +471,7 @@ defmodule Lux.LLM.Ollama do
     endpoint = Application.get_env(:lux, Lux.LLM.Ollama, [])[:endpoint] || @default_endpoint
     url = "#{endpoint}/api/delete"
 
-    case Req.delete(url, json: %{name: model_name}) do
+    case Req.delete(url, json: %{model: model_name}) do
       {:ok, %{status: 200, body: body}} -> {:ok, body}
       {:ok, %{status: status}} -> {:error, "Delete failed: HTTP #{status}"}
       {:error, reason} -> {:error, "Delete failed: #{inspect(reason)}"}
@@ -447,7 +484,7 @@ defmodule Lux.LLM.Ollama do
     endpoint = Application.get_env(:lux, Lux.LLM.Ollama, [])[:endpoint] || @default_endpoint
     url = "#{endpoint}/api/show"
 
-    payload = %{name: model_name}
+    payload = %{model: model_name}
 
     case Req.post(url, json: payload) do
       {:ok, %{status: 200, body: body}} -> {:ok, body}
