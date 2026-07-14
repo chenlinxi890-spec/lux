@@ -1,4 +1,4 @@
-﻿defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
+defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
   @moduledoc """
   Send a message via a Discord webhook.
 

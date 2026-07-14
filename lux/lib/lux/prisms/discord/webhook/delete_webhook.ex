@@ -1,4 +1,4 @@
-﻿defmodule Lux.Prisms.Discord.Webhook.DeleteWebhook do
+defmodule Lux.Prisms.Discord.Webhook.DeleteWebhook do
   @moduledoc """
   Delete a webhook from a Discord channel.
 

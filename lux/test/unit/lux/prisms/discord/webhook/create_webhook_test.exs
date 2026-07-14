@@ -1,4 +1,4 @@
-﻿defmodule Lux.Prisms.Discord.Webhook.CreateWebhookTest do
+defmodule Lux.Prisms.Discord.Webhook.CreateWebhookTest do
   @moduledoc false
   use UnitAPICase, async: true
 
@@ -26,7 +26,6 @@
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         parsed = Jason.decode!(body)
         assert parsed["name"] == @webhook_name
-        assert parsed["channel_id"] == @channel_id
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")

@@ -1,4 +1,4 @@
-﻿defmodule Lux.Prisms.Discord.Webhook.EditWebhook do
+defmodule Lux.Prisms.Discord.Webhook.EditWebhook do
   @moduledoc """
   Edit an existing webhook in a Discord channel.
 

@@ -1,4 +1,4 @@
-﻿defmodule Lux.Prisms.Discord.Webhook.CreateWebhook do
+defmodule Lux.Prisms.Discord.Webhook.CreateWebhook do
   @moduledoc """
   Create a webhook for a Discord channel.
 
