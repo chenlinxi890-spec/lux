@@ -110,7 +110,7 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhook do
              avatar_url: resp["avatar"]
            }}
 
-        {:ok, %{"message" => message}} = err when is_binary(message) ->
+        {:ok, %{"message" => message}} when is_binary(message) ->
           # Discord returns 4xx/5xx errors with message field
           {:error, {400, message}}
 
