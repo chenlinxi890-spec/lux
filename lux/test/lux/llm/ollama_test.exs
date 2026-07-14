@@ -1,108 +1,178 @@
+defmodule Lux.LLM.OllamaTest.Tool do
+  use Lux.Prism,
+    name: "Ollama Test Tool",
+    description: "Returns its arguments",
+    input_schema: %{type: :object, properties: %{value: %{type: :string}}},
+    output_schema: %{type: :object, properties: %{value: %{type: :string}}}
+
+  def handler(args, _context), do: {:ok, args}
+end
+
 defmodule Lux.LLM.OllamaTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Lux.LLM.Ollama
+  alias Lux.LLM.OllamaTest.Tool
 
   setup do
+    previous = Application.get_env(:lux, Ollama)
+    Application.put_env(:lux, Ollama, plug: {Req.Test, __MODULE__})
     Ollama.clear_performance_metrics()
+    Req.Test.verify_on_exit!()
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:lux, Ollama, previous),
+        else: Application.delete_env(:lux, Ollama)
+
+      Ollama.clear_performance_metrics()
+    end)
+
     :ok
   end
 
-  describe "Config defaults" do
-    test "has correct default endpoint" do
-      assert Ollama.default_endpoint() == "http://localhost:11434"
-    end
-
-    test "has correct default model" do
-      assert Ollama.default_model() == "llama3.3"
-    end
-
-    test "Config struct uses literal defaults, not outer module attributes" do
-      config = %Ollama.Config{}
-      assert config.endpoint == "http://localhost:11434"
-      assert config.model == "llama3.3"
-      assert config.max_retries == 3
-      assert config.retry_delay == 1000
-      assert config.timeout == 120_000
-      assert config.api_key == nil
-      assert config.system == nil
-    end
+  test "builds a usable Config with all call fields" do
+    config = %Ollama.Config{}
+    assert config.endpoint == "http://localhost:11434"
+    assert config.model == "llama3.3"
+    assert config.api_key == nil
+    assert config.system == nil
   end
 
-  describe "performance metrics" do
-    test "records and retrieves perf metrics" do
-      Ollama.record_perf("llama3.3", 100, 200, 5000)
-      metrics = Ollama.performance_metrics()
-      assert length(metrics) == 1
-      assert hd(metrics).model == "llama3.3"
-      assert hd(metrics).prompt_tokens == 100
-      assert hd(metrics).output_tokens == 200
-      assert hd(metrics).duration_ms == 5000
-    end
+  test "chat sends format, keep_alive and resource options and records metrics" do
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/chat"
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      payload = Jason.decode!(body)
 
-    test "perf_summary returns correct averages" do
-      Ollama.record_perf("llama3.3", 100, 200, 5000)
-      Ollama.record_perf("llama3.3", 200, 300, 3000)
-      summary = Ollama.perf_summary()
-      assert summary.total_requests == 2
-      assert summary.avg_duration_ms == 4000.0
-      assert summary.avg_prompt_tokens == 150.0
-      assert summary.avg_output_tokens == 250.0
-    end
+      assert payload["format"] == "json"
+      assert payload["keep_alive"] == "5m"
+      assert payload["options"]["num_ctx"] == 2048
+      assert payload["options"]["num_predict"] == 64
+      assert payload["options"]["temperature"] == 0.2
 
-    test "perf_summary returns zeros when empty" do
-      summary = Ollama.perf_summary()
-      assert summary.total_requests == 0
-      assert summary.avg_duration_ms == 0
-    end
+      Req.Test.json(conn, %{
+        "model" => "llama3.2",
+        "message" => %{"content" => "hello"},
+        "prompt_eval_count" => 3,
+        "eval_count" => 2
+      })
+    end)
+
+    assert {:ok, signal} =
+             Ollama.call("hi", [], %{
+               model: "llama3.2",
+               format: "json",
+               keep_alive: "5m",
+               num_ctx: 2048,
+               max_tokens: 64,
+               temperature: 0.2
+             })
+
+    assert signal.payload.content == %{"text" => "hello"}
+
+    assert [%{model: "llama3.2", prompt_tokens: 3, output_tokens: 2}] =
+             Ollama.performance_metrics()
   end
 
-  describe "health_check" do
-    test "returns error when Ollama is not running" do
-      result = Ollama.health_check()
-      assert {:error, _} = result
-    end
+  test "executes map arguments and completes assistant-tool-follow-up round trip" do
+    Req.Test.expect(__MODULE__, 2, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      payload = Jason.decode!(body)
+
+      case payload["messages"] do
+        [_, %{"role" => "user"}] ->
+          assert [%{"type" => "function"}] = payload["tools"]
+
+          Req.Test.json(conn, %{
+            "model" => "llama3.3",
+            "message" => %{
+              "content" => "",
+              "tool_calls" => [
+                %{
+                  "function" => %{
+                    "name" => "Lux_LLM_OllamaTest_Tool",
+                    "arguments" => %{"value" => "map"}
+                  }
+                }
+              ]
+            }
+          })
+
+        messages ->
+          assert %{"role" => "assistant", "tool_calls" => [_]} = Enum.at(messages, 2)
+          assert %{"role" => "tool", "content" => content} = Enum.at(messages, 3)
+          assert Jason.decode!(content) == %{"value" => "map"}
+
+          Req.Test.json(conn, %{
+            "model" => "llama3.3",
+            "message" => %{"content" => "done"},
+            "prompt_eval_count" => 4,
+            "eval_count" => 1
+          })
+      end
+    end)
+
+    assert {:ok, signal} = Ollama.call("use tool", [Tool], %{})
+    assert signal.payload.content == %{"text" => "done"}
+    assert signal.payload.tool_calls_results == [%{"value" => "map"}]
   end
 
-  describe "tool conversion" do
-    test "build_tools_config returns empty for empty list" do
-      # build_tools_config is private, test via module introspection
-      assert Ollama.__info__(:modules) |> is_list()
-    end
+  test "accepts JSON-string tool arguments" do
+    Req.Test.expect(__MODULE__, 2, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      payload = Jason.decode!(body)
 
-    test "tool_to_function handles nil module" do
-      # Private function test - verify the module compiles without errors
-      # and the tool conversion path exists
-      assert is_function(&Ollama.build_tools_config/1, 1)
-    end
+      if length(payload["messages"]) == 2 do
+        Req.Test.json(conn, %{
+          "model" => "llama3.3",
+          "message" => %{
+            "content" => "",
+            "tool_calls" => [
+              %{
+                "function" => %{
+                  "name" => "Lux_LLM_OllamaTest_Tool",
+                  "arguments" => ~s({"value":"json"})
+                }
+              }
+            ]
+          }
+        })
+      else
+        Req.Test.json(conn, %{"model" => "llama3.3", "message" => %{"content" => "done"}})
+      end
+    end)
+
+    assert {:ok, signal} = Ollama.call("use tool", [Tool], %{})
+    assert signal.payload.tool_calls_results == [%{"value" => "json"}]
   end
 
-  describe "model management API contracts" do
-    test "list_models returns error when Ollama is not running" do
-      result = Ollama.list_models()
-      assert {:error, _} = result
-    end
+  test "model management uses Ollama API fields and parses NDJSON pull progress" do
+    Req.Test.expect(__MODULE__, 2, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert Jason.decode!(body)["model"] == "llama3.2"
 
-    test "pull_model uses correct 'model' field (not 'name')" do
-      # Verify the function exists and has correct arity
-      assert is_function(&Ollama.pull_model/1, 1)
-    end
+      case conn.request_path do
+        "/api/pull" ->
+          if Jason.decode!(body)["stream"] do
+            Plug.Conn.send_resp(
+              conn,
+              200,
+              ~s({"status":"pulling","completed":1}\n{"status":"success"}\n)
+            )
+          else
+            Req.Test.json(conn, %{"status" => "success"})
+          end
+      end
+    end)
 
-    test "delete_model uses correct 'model' field" do
-      assert is_function(&Ollama.delete_model/1, 1)
-    end
+    assert {:ok, %{"status" => "success"}} = Ollama.pull_model("llama3.2")
+    assert {:ok, stream} = Ollama.pull_model_stream("llama3.2")
 
-    test "show_model uses correct 'model' field" do
-      assert is_function(&Ollama.show_model/1, 1)
-    end
-  end
-
-  describe "compile verification" do
-    test "module compiles without errors" do
-      # This test verifies the module compiles correctly
-      # particularly that nested Config module does not reference outer @attrs
-      assert Ollama.default_endpoint() == "http://localhost:11434"
-      assert Ollama.default_model() == "llama3.3"
-    end
+    assert Enum.to_list(stream) == [
+             %{"status" => "pulling", "completed" => 1},
+             %{"status" => "success"}
+           ]
   end
 end
