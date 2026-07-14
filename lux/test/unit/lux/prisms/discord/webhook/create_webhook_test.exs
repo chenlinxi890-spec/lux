@@ -29,18 +29,25 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhookTest do
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(200, Jason.encode!(%{
-          "id" => "987654321098765432",
-          "name" => @webhook_name,
-          "channel_id" => @channel_id,
-          "url" => "https://discord.com/api/webhooks/987654321098765432/test-token"
-        }))
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "987654321098765432",
+            "name" => @webhook_name,
+            "channel_id" => @channel_id,
+            "url" => "https://discord.com/api/webhooks/987654321098765432/test-token"
+          })
+        )
       end)
 
-      assert {:ok, result} = CreateWebhook.handler(%{
-        channel_id: @channel_id,
-        name: @webhook_name
-      }, @agent_ctx)
+      assert {:ok, result} =
+               CreateWebhook.handler(
+                 %{
+                   channel_id: @channel_id,
+                   name: @webhook_name
+                 },
+                 @agent_ctx
+               )
 
       assert result.webhook_id == "987654321098765432"
       assert result.name == @webhook_name
@@ -62,19 +69,26 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhookTest do
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(200, Jason.encode!(%{
-          "id" => "987654321098765432",
-          "name" => @webhook_name,
-          "channel_id" => @channel_id,
-          "url" => "https://discord.com/api/webhooks/987654321098765432/test-token"
-        }))
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "987654321098765432",
+            "name" => @webhook_name,
+            "channel_id" => @channel_id,
+            "url" => "https://discord.com/api/webhooks/987654321098765432/test-token"
+          })
+        )
       end)
 
-      assert {:ok, result} = CreateWebhook.handler(%{
-        channel_id: @channel_id,
-        name: @webhook_name,
-        avatar_url: avatar_url
-      }, @agent_ctx)
+      assert {:ok, result} =
+               CreateWebhook.handler(
+                 %{
+                   channel_id: @channel_id,
+                   name: @webhook_name,
+                   avatar_url: avatar_url
+                 },
+                 @agent_ctx
+               )
 
       assert result.webhook_id == "987654321098765432"
     end
@@ -82,23 +96,36 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhookTest do
 
   describe "handler/2 - errors" do
     test "returns error when channel_id is missing" do
-      assert {:error, "Missing or invalid channel_id"} = CreateWebhook.handler(%{
-        name: @webhook_name
-      }, @agent_ctx)
+      assert {:error, "Missing or invalid channel_id"} =
+               CreateWebhook.handler(
+                 %{
+                   name: @webhook_name
+                 },
+                 @agent_ctx
+               )
     end
 
     test "returns error when name is missing" do
-      assert {:error, "Missing or invalid name (must be 1-80 characters)"} = CreateWebhook.handler(%{
-        channel_id: @channel_id
-      }, @agent_ctx)
+      assert {:error, "Missing or invalid name (must be 1-80 characters)"} =
+               CreateWebhook.handler(
+                 %{
+                   channel_id: @channel_id
+                 },
+                 @agent_ctx
+               )
     end
 
     test "returns error when name exceeds 80 characters" do
       long_name = String.duplicate("a", 81)
-      assert {:error, "Missing or invalid name (must be 1-80 characters)"} = CreateWebhook.handler(%{
-        channel_id: @channel_id,
-        name: long_name
-      }, @agent_ctx)
+
+      assert {:error, "Missing or invalid name (must be 1-80 characters)"} =
+               CreateWebhook.handler(
+                 %{
+                   channel_id: @channel_id,
+                   name: long_name
+                 },
+                 @agent_ctx
+               )
     end
 
     test "handles Discord API error response" do
@@ -107,15 +134,22 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhookTest do
       Req.Test.expect(DiscordClientMock, fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(403, Jason.encode!(%{
-          "message" => "Missing Permissions"
-        }))
+        |> Plug.Conn.send_resp(
+          403,
+          Jason.encode!(%{
+            "message" => "Missing Permissions"
+          })
+        )
       end)
 
-      assert {:error, {403, "Missing Permissions"}} = CreateWebhook.handler(%{
-        channel_id: @channel_id,
-        name: @webhook_name
-      }, @agent_ctx)
+      assert {:error, {403, "Missing Permissions"}} =
+               CreateWebhook.handler(
+                 %{
+                   channel_id: @channel_id,
+                   name: @webhook_name
+                 },
+                 @agent_ctx
+               )
     end
   end
 end

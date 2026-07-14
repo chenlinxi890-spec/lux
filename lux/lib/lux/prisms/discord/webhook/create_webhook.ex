@@ -85,7 +85,6 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhook do
     with {:ok, channel_id} <- validate_channel_id(params),
          {:ok, name} <- validate_name(params),
          avatar_url <- Map.get(params, :avatar_url) do
-
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} creating webhook '#{name}' in channel #{channel_id}")
 
@@ -93,22 +92,33 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhook do
       body = if(avatar_url, Map.put(body, "avatar", avatar_url), body)
 
       case Client.request(:post, "/channels/#{channel_id}/webhooks", %{json: body}) do
-        {:ok, %{"id" => webhook_id, "name" => webhook_name, "channel_id" => returned_channel, "url" => url} = resp} ->
+        {:ok,
+         %{
+           "id" => webhook_id,
+           "name" => webhook_name,
+           "channel_id" => returned_channel,
+           "url" => url
+         } = resp} ->
           Logger.info("Successfully created webhook #{webhook_id} in channel #{returned_channel}")
-          {:ok, %{
-            webhook_id: webhook_id,
-            name: webhook_name,
-            channel_id: returned_channel,
-            url: url,
-            avatar_url: resp["avatar"]
-          }}
+
+          {:ok,
+           %{
+             webhook_id: webhook_id,
+             name: webhook_name,
+             channel_id: returned_channel,
+             url: url,
+             avatar_url: resp["avatar"]
+           }}
 
         {:ok, %{"message" => message}} = err when is_binary(message) ->
           # Discord returns 4xx/5xx errors with message field
           {:error, {400, message}}
 
         {:error, {status, message}} ->
-          Logger.error("Failed to create webhook in channel #{channel_id}: #{inspect({status, message})}")
+          Logger.error(
+            "Failed to create webhook in channel #{channel_id}: #{inspect({status, message})}"
+          )
+
           {:error, {status, message}}
 
         {:error, error} ->
@@ -127,8 +137,11 @@ defmodule Lux.Prisms.Discord.Webhook.CreateWebhook do
 
   defp validate_name(params) do
     case Map.fetch(params, :name) do
-      {:ok, val} when is_binary(val) and byte_size(val) >= 1 and byte_size(val) <= 80 -> {:ok, val}
-      _ -> {:error, "Missing or invalid name (must be 1-80 characters)"}
+      {:ok, val} when is_binary(val) and byte_size(val) >= 1 and byte_size(val) <= 80 ->
+        {:ok, val}
+
+      _ ->
+        {:error, "Missing or invalid name (must be 1-80 characters)"}
     end
   end
 end

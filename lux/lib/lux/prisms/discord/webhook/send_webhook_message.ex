@@ -87,18 +87,19 @@ defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
   def handler(params, agent) do
     with {:ok, webhook_url} <- validate_webhook_url(params),
          {:ok, body} <- build_message_body(params) do
-
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} sending webhook message")
 
       case do_post(webhook_url <> "?wait=true", body) do
         {:ok, %{"id" => message_id} = resp} ->
           Logger.info("Successfully sent webhook message #{message_id}")
-          {:ok, %{
-            sent: true,
-            message_id: message_id,
-            content: resp["content"]
-          }}
+
+          {:ok,
+           %{
+             sent: true,
+             message_id: message_id,
+             content: resp["content"]
+           }}
 
         {:ok, %{"message" => message}} ->
           {:error, {400, message}}
@@ -121,13 +122,13 @@ defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
   def handler_silent(params, agent) do
     with {:ok, webhook_url} <- validate_webhook_url(params),
          {:ok, body} <- build_message_body(params) do
-
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} sending silent webhook message")
 
-      silent_url = if String.contains?(webhook_url, "?"),
-        do: "#{webhook_url}&wait=false",
-        else: "#{webhook_url}?wait=false"
+      silent_url =
+        if String.contains?(webhook_url, "?"),
+          do: "#{webhook_url}&wait=false",
+          else: "#{webhook_url}?wait=false"
 
       case do_post(silent_url, body) do
         {:ok, _} ->
@@ -143,10 +144,14 @@ defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
 
   defp validate_webhook_url(params) do
     case Map.fetch(params, :webhook_url) do
-      {:ok, url} when is_binary(url) and String.starts_with?(url, "https://discord.com/api/webhooks/") ->
+      {:ok, url}
+      when is_binary(url) and String.starts_with?(url, "https://discord.com/api/webhooks/") ->
         {:ok, url}
+
       {:ok, url} when is_binary(url) ->
-        {:error, "webhook_url must be a valid Discord webhook URL starting with https://discord.com/api/webhooks/"}
+        {:error,
+         "webhook_url must be a valid Discord webhook URL starting with https://discord.com/api/webhooks/"}
+
       _ ->
         {:error, "Missing webhook_url"}
     end
@@ -193,6 +198,7 @@ defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
         # Discord Execute Webhook with wait=false returns 204 No Content
         Logger.info("Webhook message sent (204 No Content)")
         {:ok, %{}}
+
       {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
         {:ok, resp_body}
 
@@ -208,6 +214,7 @@ defmodule Lux.Prisms.Discord.Webhook.SendWebhookMessage do
   end
 
   defp maybe_add_plug(req, nil), do: req
+
   defp maybe_add_plug(req, plug) do
     Map.update!(req, :request_options, fn opts ->
       Keyword.put(opts, :plug, plug)

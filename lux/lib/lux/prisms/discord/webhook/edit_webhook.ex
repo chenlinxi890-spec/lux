@@ -77,19 +77,20 @@ defmodule Lux.Prisms.Discord.Webhook.EditWebhook do
   def handler(params, agent) do
     with {:ok, webhook_id} <- validate_webhook_id(params),
          {:ok, changes} <- build_edit_body(params) do
-
       agent_name = agent[:name] || "Unknown Agent"
       Logger.info("Agent #{agent_name} editing webhook #{webhook_id}: #{inspect(changes)}")
 
       case Client.request(:patch, "/webhooks/#{webhook_id}", %{json: changes}) do
         {:ok, %{"id" => returned_id, "name" => name, "channel_id" => channel_id} = resp} ->
           Logger.info("Successfully edited webhook #{returned_id}")
-          {:ok, %{
-            webhook_id: returned_id,
-            name: name,
-            channel_id: channel_id,
-            avatar_url: resp["avatar"]
-          }}
+
+          {:ok,
+           %{
+             webhook_id: returned_id,
+             name: name,
+             channel_id: channel_id,
+             avatar_url: resp["avatar"]
+           }}
 
         {:error, {status, message}} ->
           Logger.error("Failed to edit webhook #{webhook_id}: #{inspect({status, message})}")
