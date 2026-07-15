@@ -1,9 +1,10 @@
-﻿defmodule Lux.Integrations.CurveFinance do
+defmodule Lux.Integrations.CurveFinance do
   @moduledoc """
-  Curve Finance Integration for stablecoin management and yield optimization.
+  Read-only Curve Finance pool and gauge analytics.
 
-  Provides pool management, gauge staking, CRV rewards handling,
-  slippage estimation, and automated rebalancing helpers.
+  Fetches data from a configured GraphQL adapter and provides pure estimation
+  helpers. It does not submit transactions, manage positions, stake gauges,
+  claim CRV, or execute rebalances.
 
   ## Configuration
 
@@ -30,7 +31,6 @@
       apy = CurveFinance.estimate_crv_apy(0.005, 0.6, 500_000_000)
   """
 
-  @default_subgraph "https://api.thegraph.com/subgraphs/name/messari/curve-finance-ethereum"
   @default_registry "0x90E00ACe148ca3b23Ac1bC8C240C2a7Dd9c2d7f6"
   @default_crv_token "0xD533a949740bb3306d119CC777fa900bA034cd52"
   @annual_crv_emission 200_000_000
@@ -60,7 +60,9 @@
   @spec subgraph_url() :: String.t()
   def subgraph_url do
     Application.get_env(:lux, __MODULE__, [])[:subgraph_url] ||
-      System.get_env("CURVE_SUBGRAPH_URL") || @default_subgraph
+      System.get_env("CURVE_SUBGRAPH_URL") ||
+      raise ArgumentError,
+            "Curve subgraph is not configured; set :subgraph_url or CURVE_SUBGRAPH_URL"
   end
 
   @doc "Returns the Ethereum RPC URL."
@@ -115,11 +117,10 @@
     }
     """
 
-    case Req.post(subgraph_url(),
-      json: %{query: query},
-      headers: headers(),
-      receive_timeout: 30_000
-    ) do
+    case Req.post(
+           subgraph_url(),
+           request_options(json: %{query: query}, headers: headers(), receive_timeout: 30_000)
+         ) do
       {:ok, %{status: 200, body: %{"data" => %{"pools" => pools}}}} ->
         parsed = Enum.map(pools, &parse_pool/1)
         {:ok, parsed}
@@ -156,11 +157,10 @@
     }
     """
 
-    case Req.post(subgraph_url(),
-      json: %{query: query},
-      headers: headers(),
-      receive_timeout: 30_000
-    ) do
+    case Req.post(
+           subgraph_url(),
+           request_options(json: %{query: query}, headers: headers(), receive_timeout: 30_000)
+         ) do
       {:ok, %{status: 200, body: %{"data" => %{"gauges" => gauges}}}} ->
         parsed = Enum.map(gauges, &parse_gauge/1)
         {:ok, parsed}
@@ -187,7 +187,8 @@
       0.00002
   """
   @spec estimate_slippage(trade_size_usd :: float(), pool_tvl_usd :: float()) :: float()
-  def estimate_slippage(trade_size_usd, pool_tvl_usd) when is_number(pool_tvl_usd) and pool_tvl_usd > 0 do
+  def estimate_slippage(trade_size_usd, pool_tvl_usd)
+      when is_number(pool_tvl_usd) and pool_tvl_usd > 0 do
     ratio = trade_size_usd / pool_tvl_usd
     min(ratio * 0.001, 0.05)
   end
@@ -213,12 +214,13 @@
     sym_a = String.upcase(token_a)
     sym_b = String.upcase(token_b)
 
-    matching = Enum.filter(pools, fn pool ->
-      syms = Enum.map(pool.coins, &String.upcase(&1.symbol || ""))
-      sym_a in syms and sym_b in syms
-    end)
+    matching =
+      Enum.filter(pools, fn pool ->
+        syms = Enum.map(pool.coins, &String.upcase(&1.symbol || ""))
+        sym_a in syms and sym_b in syms
+      end)
 
-    case Enum.max_by(matching, &(Map.get(&1, :tvl_usd, 0.0)), fn -> nil end) do
+    case Enum.max_by(matching, &Map.get(&1, :tvl_usd, 0.0), fn -> nil end) do
       nil -> {:error, :no_pool}
       pool -> {:ok, pool}
     end
@@ -236,7 +238,11 @@
       iex> CurveFinance.estimate_crv_apy(0.005, 0.6, 500_000_000)
       0.0000012
   """
-  @spec estimate_crv_apy(gauge_weight :: float(), crv_price_usd :: float(), pool_tvl_usd :: float()) :: float()
+  @spec estimate_crv_apy(
+          gauge_weight :: float(),
+          crv_price_usd :: float(),
+          pool_tvl_usd :: float()
+        ) :: float()
   def estimate_crv_apy(gauge_weight, crv_price_usd, pool_tvl_usd)
       when is_number(pool_tvl_usd) and pool_tvl_usd > 0
       when is_number(gauge_weight) and gauge_weight >= 0
@@ -259,11 +265,15 @@
   end
 
   @doc """
-  Simulates an automated rebalancing decision.
+  Computes a read-only rebalancing recommendation.
 
   Returns `:rebalance` if the drift exceeds the threshold, `:hold` otherwise.
   """
-  @spec should_rebalance(current_allocation :: float(), target_allocation :: float(), threshold :: float()) ::
+  @spec should_rebalance(
+          current_allocation :: float(),
+          target_allocation :: float(),
+          threshold :: float()
+        ) ::
           :rebalance | :hold
   def should_rebalance(current, target, threshold) do
     drift = abs(current - target)
@@ -277,10 +287,17 @@
   """
   @spec fetch_crv_price() :: {:ok, float()} | {:error, term()}
   def fetch_crv_price do
-    case Req.get("https://api.coingecko.com/api/v3/simple/price",
-      query: %{ids: "curve-dao-token", vs_currencies: "usd"},
-      receive_timeout: 15_000
-    ) do
+    endpoint =
+      Application.get_env(:lux, __MODULE__, [])[:price_url] ||
+        "https://api.coingecko.com/api/v3/simple/price"
+
+    case Req.get(
+           endpoint,
+           request_options(
+             query: %{ids: "curve-dao-token", vs_currencies: "usd"},
+             receive_timeout: 15_000
+           )
+         ) do
       {:ok, %{status: 200, body: %{"curve-dao-token" => %{"usd" => price}}}} ->
         {:ok, price / 1.0}
 
@@ -306,6 +323,10 @@
 
   # ---- Internal helpers ----
 
+  defp request_options(options) do
+    Keyword.merge(options, Application.get_env(:lux, __MODULE__, [])[:req_options] || [])
+  end
+
   defp parse_pool(%{"coins" => coins} = data) do
     %{
       id: data["id"],
@@ -315,13 +336,14 @@
       fee: parse_float(data["fee"]),
       tvl_usd: parse_float(data["totalValueLockedUSD"]),
       volume_usd: parse_float(data["volumeUSD"]),
-      coins: Enum.map(coins, fn c ->
-        %{
-          address: c["address"] || "",
-          symbol: c["symbol"] || "",
-          decimals: String.to_integer(c["decimals"] || "18")
-        }
-      end)
+      coins:
+        Enum.map(coins, fn c ->
+          %{
+            address: c["address"] || "",
+            symbol: c["symbol"] || "",
+            decimals: String.to_integer(c["decimals"] || "18")
+          }
+        end)
     }
   end
 

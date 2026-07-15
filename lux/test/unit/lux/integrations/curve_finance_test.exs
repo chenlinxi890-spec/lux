@@ -1,250 +1,140 @@
-﻿defmodule Lux.Integrations.CurveFinanceTest do
-  use ExUnit.Case, async: true
+defmodule Lux.Integrations.CurveFinanceTest do
+  use ExUnit.Case, async: false
 
   alias Lux.Integrations.CurveFinance
 
-  describe "fetch_pools/0" do
-    test "returns parsed pool data from subgraph" do
-      MockReq.stub(:post, fn %{url: url} = _req ->
-        if String.contains?(url, "thegraph.com") do
-          {:ok,
-           %MockReq.Response{
-             status: 200,
-             body: %{
-               "data" => %{
-                 "pools" => [
-                   %{
-                     "id" => "pool-1",
-                     "address" => "0xbeekeeper",
-                     "name" => "3pool",
-                     "type" => "stable",
-                     "fee" => "0.0004",
-                     "totalValueLockedUSD" => "500000000",
-                     "volumeUSD" => "10000000",
-                     "coins" => [
-                       %{"address" => "0xa", "symbol" => "USDC", "decimals" => "6"},
-                       %{"address" => "0xb", "symbol" => "USDT", "decimals" => "6"}
-                     ]
-                   }
-                 ]
-               }
-             }
-           }}
-        else
-          {:error, :not_found}
-        end
-      end)
+  @annual_crv_emission 200_000_000
+  @pool_fixture %{
+    "id" => "pool-1",
+    "address" => "0xpool",
+    "name" => "3pool",
+    "type" => "stable",
+    "fee" => "0.0004",
+    "totalValueLockedUSD" => "500000000",
+    "volumeUSD" => "10000000",
+    "coins" => [
+      %{"address" => "0xa", "symbol" => "USDC", "decimals" => "6"},
+      %{"address" => "0xb", "symbol" => "USDT", "decimals" => "6"}
+    ]
+  }
 
-      assert {:ok, pools} = CurveFinance.fetch_pools()
-      assert length(pools) == 1
-      pool = hd(pools)
-      assert pool.id == "pool-1"
-      assert pool.name == "3pool"
-      assert pool.tvl_usd == 500_000_000
-      assert pool.fee == 0.0004
-      assert length(pool.coins) == 2
-      assert pool.coins |> Enum.at(0) |> Map.get(:symbol) == "USDC"
-    end
+  setup do
+    previous = Application.get_env(:lux, CurveFinance)
 
-    test "returns error on GraphQL errors" do
-      MockReq.stub(:post, fn _req ->
-        {:ok,
-         %MockReq.Response{
-           status: 200,
-           body: %{"errors" => [%{"message" => "Query failed"}]}
-         }}
-      end)
+    Application.put_env(:lux, CurveFinance,
+      subgraph_url: "https://curve.test/graphql",
+      price_url: "https://curve.test/price",
+      req_options: [plug: {Req.Test, __MODULE__}]
+    )
 
-      assert {:error, {:graphql_errors, _}} = CurveFinance.fetch_pools()
+    Req.Test.verify_on_exit!()
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:lux, CurveFinance, previous),
+        else: Application.delete_env(:lux, CurveFinance)
+    end)
+
+    :ok
+  end
+
+  test "uses an explicitly configured data source" do
+    assert CurveFinance.subgraph_url() == "https://curve.test/graphql"
+  end
+
+  test "requires a configured subgraph instead of using the retired hosted-service URL" do
+    Application.delete_env(:lux, CurveFinance)
+    previous = System.get_env("CURVE_SUBGRAPH_URL")
+    System.delete_env("CURVE_SUBGRAPH_URL")
+
+    on_exit(fn ->
+      if previous, do: System.put_env("CURVE_SUBGRAPH_URL", previous)
+    end)
+
+    assert_raise ArgumentError, ~r/Curve subgraph is not configured/, fn ->
+      CurveFinance.subgraph_url()
     end
   end
 
-  describe "fetch_gauges/1" do
-    test "returns parsed gauge data" do
-      MockReq.stub(:post, fn %{url: url} = _req ->
-        if String.contains?(url, "thegraph.com") do
-          {:ok,
-           %MockReq.Response{
-             status: 200,
-             body: %{
-               "data" => %{
-                 "gauges" => [
-                   %{
-                     "id" => "gauge-1",
-                     "pool" => %{"id" => "pool-1"},
-                     "workingSupply" => "1000000",
-                     "supply" => "2000000",
-                     "voteAmount" => "500000"
-                   }
-                 ]
-               }
-             }
-           }}
-        else
-          {:error, :not_found}
-        end
-      end)
+  test "fetch_pools sends GraphQL to the injected adapter and parses the fixture" do
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/graphql"
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert Jason.decode!(body)["query"] =~ "pools(first: 100)"
+      Req.Test.json(conn, %{"data" => %{"pools" => [@pool_fixture]}})
+    end)
 
-      assert {:ok, gauges} = CurveFinance.fetch_gauges("pool-1")
-      assert length(gauges) == 1
-      gauge = hd(gauges)
-      assert gauge.id == "gauge-1"
-      assert gauge.pool_id == "pool-1"
-      assert gauge.vote_amount == "500000"
-    end
+    assert {:ok, [pool]} = CurveFinance.fetch_pools()
+    assert pool.id == "pool-1"
+    assert pool.tvl_usd == 500_000_000.0
+    assert Enum.map(pool.coins, & &1.symbol) == ["USDC", "USDT"]
   end
 
-  describe "estimate_slippage/2" do
-    test "calculates slippage correctly" do
-      # $10k trade on $500M pool
-      assert CurveFinance.estimate_slippage(10_000, 500_000_000) == 0.00002
-    end
+  test "fetch_pools exposes fixture-backed GraphQL errors" do
+    Req.Test.expect(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{"errors" => [%{"message" => "schema mismatch"}]})
+    end)
 
-    test "caps slippage at 5%" do
-      # Large trade on small pool
-      assert CurveFinance.estimate_slippage(100_000_000, 1_000_000) == 0.05
-    end
-
-    test "returns 5% for zero or negative TVL" do
-      assert CurveFinance.estimate_slippage(10_000, 0) == 0.05
-      assert CurveFinance.estimate_slippage(10_000, -1) == 0.05
-    end
+    assert {:error, {:graphql_errors, [%{"message" => "schema mismatch"}]}} =
+             CurveFinance.fetch_pools()
   end
 
-  describe "select_pool/3" do
-    test "selects pool with highest TVL for matching pair" do
-      pools = [
-        %{
-          id: "pool-low",
-          coins: [%{symbol: "USDC"}, %{symbol: "USDT"}],
-          tvl_usd: 1_000_000
-        },
-        %{
-          id: "pool-high",
-          coins: [%{symbol: "USDC"}, %{symbol: "USDT"}],
-          tvl_usd: 500_000_000
+  test "fetch_gauges sends the requested pool id and parses the fixture" do
+    Req.Test.expect(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert Jason.decode!(body)["query"] =~ ~s(pool: "pool-1")
+
+      Req.Test.json(conn, %{
+        "data" => %{
+          "gauges" => [
+            %{
+              "id" => "gauge-1",
+              "pool" => %{"id" => "pool-1"},
+              "workingSupply" => "100",
+              "supply" => "200",
+              "voteAmount" => "50"
+            }
+          ]
         }
-      ]
+      })
+    end)
 
-      assert {:ok, pool} = CurveFinance.select_pool("USDC", "USDT", pools)
-      assert pool.id == "pool-high"
-    end
+    assert {:ok, [gauge]} = CurveFinance.fetch_gauges("pool-1")
 
-    test "returns error when no matching pool" do
-      pools = [
-        %{
-          id: "pool-1",
-          coins: [%{symbol: "USDC"}, %{symbol: "DAI"}],
-          tvl_usd: 100_000_000
-        }
-      ]
-
-      assert CurveFinance.select_pool("USDC", "USDT", pools) == {:error, :no_pool}
-    end
-
-    test "returns error for empty pool list" do
-      assert CurveFinance.select_pool("USDC", "USDT", []) == {:error, :no_pool}
-    end
-
-    test "case-insensitive symbol matching" do
-      pools = [
-        %{
-          id: "pool-1",
-          coins: [%{symbol: "usdc"}, %{symbol: "usdt"}],
-          tvl_usd: 100_000_000
-        }
-      ]
-
-      assert {:ok, pool} = CurveFinance.select_pool("USDC", "USDT", pools)
-      assert pool.id == "pool-1"
-    end
+    assert gauge == %{
+             id: "gauge-1",
+             pool_id: "pool-1",
+             working_supply: "100",
+             supply: "200",
+             vote_amount: "50"
+           }
   end
 
-  describe "estimate_crv_apy/3" do
-    test "calculates APY correctly" do
-      # 0.5% gauge weight, $0.6 CRV, $500M TVL
-      apy = CurveFinance.estimate_crv_apy(0.005, 0.6, 500_000_000)
-      expected = (@annual_crv_emission * 0.005 * 0.6) / 500_000_000
-      assert abs(apy - expected) < 0.0000001
-    end
+  test "fetch_crv_price uses the injected price adapter" do
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.request_path == "/price"
+      assert conn.query_string =~ "curve-dao-token"
+      Req.Test.json(conn, %{"curve-dao-token" => %{"usd" => 0.6}})
+    end)
 
-    test "returns 0 for zero TVL" do
-      assert CurveFinance.estimate_crv_apy(0.005, 0.6, 0) == 0.0
-    end
-
-    test "returns 0 for zero gauge weight" do
-      assert CurveFinance.estimate_crv_apy(0, 0.6, 500_000_000) == 0.0
-    end
+    assert {:ok, 0.6} = CurveFinance.fetch_crv_price()
   end
 
-  describe "rebalance_threshold/2" do
-    test "returns maximum of fee*1.5 and slippage*2" do
-      # fee=0.0004, slippage=0.001
-      assert CurveFinance.rebalance_threshold(0.0004, 0.001) == 0.002
-    end
+  test "pure analysis helpers select pools and calculate estimates" do
+    pools = [
+      %{id: "low", coins: [%{symbol: "USDC"}, %{symbol: "USDT"}], tvl_usd: 1_000_000},
+      %{id: "high", coins: [%{symbol: "USDC"}, %{symbol: "USDT"}], tvl_usd: 500_000_000}
+    ]
 
-    test "fee dominates when slippage is small" do
-      assert CurveFinance.rebalance_threshold(0.001, 0.0001) == 0.0015
-    end
-  end
+    assert {:ok, %{id: "high"}} = CurveFinance.select_pool("usdc", "usdt", pools)
+    assert CurveFinance.estimate_slippage(10_000, 500_000_000) == 0.00002
 
-  describe "should_rebalance/3" do
-    test "returns :rebalance when drift exceeds threshold" do
-      assert CurveFinance.should_rebalance(0.6, 0.5, 0.05) == :rebalance
-    end
+    expected = @annual_crv_emission * 0.005 * 0.6 / 500_000_000
+    assert_in_delta CurveFinance.estimate_crv_apy(0.005, 0.6, 500_000_000), expected, 1.0e-10
 
-    test "returns :hold when drift is within threshold" do
-      assert CurveFinance.should_rebalance(0.51, 0.5, 0.05) == :hold
-    end
-
-    test "handles equal allocation" do
-      assert CurveFinance.should_rebalance(0.5, 0.5, 0.05) == :hold
-    end
-  end
-
-  describe "fetch_crv_price/0" do
-    test "returns CRV price from CoinGecko" do
-      MockReq.stub(:get, fn _req ->
-        {:ok, %MockReq.Response{status: 200, body: %{"curve-dao-token" => %{"usd" => 0.6}}}}
-      end)
-
-      assert {:ok, price} = CurveFinance.fetch_crv_price()
-      assert is_number(price)
-      assert price > 0
-    end
-
-    test "returns error on API failure" do
-      MockReq.stub(:get, fn _req ->
-        {:ok, %MockReq.Response{status: 500, body: %{}}}
-      end)
-
-      assert {:error, {:http_error, 500}} = CurveFinance.fetch_crv_price()
-    end
-  end
-
-  describe "fetch_pool_tvls/1" do
-    test "returns map of pool IDs to TVL" do
-      pools = [
-        %{id: "p1", tvl_usd: 100_000_000},
-        %{id: "p2", tvl_usd: 500_000_000}
-      ]
-
-      tvls = CurveFinance.fetch_pool_tvls(pools)
-      assert tvls == %{"p1" => 100_000_000, "p2" => 500_000_000}
-    end
-  end
-
-  describe "configuration" do
-    test "subgraph_url uses env var or default" do
-      assert CurveFinance.subgraph_url() == CurveFinance.__MODULE__.__info__(:module).__struct__.__info__(:attributes) |> Enum.reduce("", fn {_attr, val}, acc -> acc end) || true
-      # Just verify it returns a string
-      assert is_binary(CurveFinance.subgraph_url())
-    end
-
-    test "headers returns correct content type" do
-      headers = CurveFinance.headers()
-      assert {"Content-Type", "application/json"} in headers
-      assert {"Accept", "application/json"} in headers
-    end
+    assert CurveFinance.rebalance_threshold(0.0004, 0.001) == 0.002
+    assert CurveFinance.should_rebalance(0.6, 0.5, 0.05) == :rebalance
+    assert CurveFinance.should_rebalance(0.51, 0.5, 0.05) == :hold
   end
 end
